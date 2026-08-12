@@ -33,6 +33,48 @@ Run `pnpm changeset` for user-visible fixes and features. Select the package, ch
 
 Changesets do not publish this package automatically.
 
+## Releases
+
+### First npm release
+
+The initial `0.1.0` release bootstraps npm trusted publishing:
+
+1. Confirm that you own or can publish public packages under the `@un3qual` npm scope.
+2. Run the complete local release checks:
+
+   ```sh
+   pnpm run check
+   pnpm changeset status
+   pnpm pack --dry-run --json
+   npm publish --dry-run --access public
+   ```
+
+3. Authenticate locally with npm, then publish `0.1.0` exactly once:
+
+   ```sh
+   npm login
+   npm publish --access public
+   ```
+
+4. Configure [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) with these values:
+
+   - Provider: GitHub Actions
+   - Organization or user: `Un3qual`
+   - Repository: `stylex-mangle-classnames`
+   - Workflow filename: `publish.yml`
+   - Environment: `npm`
+   - Allowed action: `npm publish`
+
+5. Create the non-prerelease GitHub Release `v0.1.0`. The workflow recognizes that the exact version is already published and exits successfully.
+
+The repository does not store an npm publishing token.
+
+### Future releases
+
+Commit a Changeset with every user-visible change. When a release is ready, run `pnpm version-packages`, review the resulting package version and changelog, then commit and push those changes to `main`. Create a non-prerelease GitHub Release whose tag is exactly `v${package.json.version}`.
+
+The publishing workflow verifies and publishes that version through npm trusted publishing. It never selects or changes a version.
+
 ## Pull requests
 
 - Explain the problem and the chosen solution.
