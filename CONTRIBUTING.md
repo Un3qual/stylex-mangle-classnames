@@ -37,6 +37,8 @@ Changesets do not publish this package automatically.
 
 Publishing uses npm trusted publishing from `.github/workflows/publish.yml`. The repository does not store an npm publishing token.
 
+The publish job intentionally relies on `publishConfig.registry` instead of configuring `registry-url` in `actions/setup-node`. The latter writes a token-auth entry to npm's user configuration and prevents npm from initiating the trusted-publisher OIDC exchange when no `NODE_AUTH_TOKEN` exists.
+
 Commit a Changeset with every user-visible change. When a release is ready:
 
 1. Run the complete local release checks:
