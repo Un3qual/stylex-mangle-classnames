@@ -22,7 +22,10 @@ function virtualEntry(): Plugin {
     },
     load(id) {
       return id === "/virtual-entry.js"
-        ? `globalThis.className = "${PREFIX}1";`
+        ? [
+            `inject({ ltr: ".${PREFIX}1{color:red}" });`,
+            `globalThis.className = "${PREFIX}1";`,
+          ].join("\n")
         : null;
     },
   };

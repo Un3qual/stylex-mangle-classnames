@@ -82,16 +82,26 @@ describe("stylexMangleClassNames", () => {
   test("maps generated classes to a through z, then aa and ab", () => {
     const originals = "123456789abcdefghijklmnopqrs"
       .split("")
-      .map((hash) => `${PREFIX}${hash}`)
-      .join(" ");
+      .map((hash) => `${PREFIX}${hash}`);
+    const source = [
+      ...originals.map((className) => `inject({ ltr: ".${className}{color:red}" });`),
+      `globalThis.classes = "${originals.join(" ")}";`,
+    ].join("\n");
+    const lastLine = rewriteBundle(source).split("\n").at(-1);
 
-    expect(rewriteBundle(`globalThis.classes = "${originals}";`)).toBe(
+    expect(lastLine).toBe(
       'globalThis.classes = "a b c d e f g h i j k l m n o p q r s t u v w x y z aa ab";',
     );
   });
 
   test("assigns one deterministic mapping across every emitted text file", () => {
-    const first = outputChunk(`globalThis.first = "${PREFIX}z ${PREFIX}1";`);
+    const first = outputChunk(
+      [
+        `inject({ ltr: ".${PREFIX}z{color:blue}" });`,
+        `inject({ ltr: ".${PREFIX}1{color:red}" });`,
+        `globalThis.first = "${PREFIX}z ${PREFIX}1";`,
+      ].join("\n"),
+    );
     const second = outputAsset(
       "styles.css",
       `.${PREFIX}1{color:red}.${PREFIX}z:hover{color:blue}`,
@@ -105,7 +115,7 @@ describe("stylexMangleClassNames", () => {
 
     runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), bundle);
 
-    expect(first.code).toBe('globalThis.first = "b a";');
+    expect(first.code.split("\n").at(-1)).toBe('globalThis.first = "b a";');
     expect(second.source).toBe(".a{color:red}.b:hover{color:blue}");
     expect(third.source).toBe('<main class="b a"></main>');
   });
@@ -114,6 +124,7 @@ describe("stylexMangleClassNames", () => {
     const atomic = `${PREFIX}1dmbf1k`;
     const spacedConstKey = `register({ constKey${" ".repeat(40)}:${" ".repeat(40)}"${atomic}" });`;
     const source = [
+      `inject({ ltr: ".${atomic}{color:red}" });`,
       `globalThis.className = "${atomic} product-card";`,
       `register({ constKey: "${atomic}", constVal: "red" });`,
       spacedConstKey,
@@ -123,6 +134,7 @@ describe("stylexMangleClassNames", () => {
 
     expect(rewriteBundle(source)).toBe(
       [
+        'inject({ ltr: ".a{color:red}" });',
         'globalThis.className = "a product-card";',
         `register({ constKey: "${atomic}", constVal: "red" });`,
         spacedConstKey,
@@ -132,11 +144,41 @@ describe("stylexMangleClassNames", () => {
     );
   });
 
+  test("preserves prefix-shaped application data that is not a generated StyleX class", () => {
+    const atomic = `${PREFIX}1`;
+    const productId = `${PREFIX}123`;
+    const source = [
+      `inject({ ltr: ".${atomic}{color:red}" });`,
+      `globalThis.className = "${atomic}";`,
+      `globalThis.productId = "${productId}";`,
+    ].join("\n");
+
+    expect(rewriteBundle(source)).toBe(
+      [
+        'inject({ ltr: ".a{color:red}" });',
+        'globalThis.className = "a";',
+        `globalThis.productId = "${productId}";`,
+      ].join("\n"),
+    );
+  });
+
+  test("preserves prefix-shaped authored CSS without a matching StyleX rule", () => {
+    const css = outputAsset("styles.css", `.${PREFIX}123{color:red}`);
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [css.fileName]: css,
+    });
+
+    expect(css.source).toBe(`.${PREFIX}123{color:red}`);
+  });
+
   test("fails when a generated short name collides with authored CSS", () => {
+    const javascript = outputChunk(`inject({ ltr: ".${PREFIX}1{color:red}" });`);
     const css = outputAsset("styles.css", `.${PREFIX}1{color:red}.a{color:blue}`);
 
     expect(() =>
       runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+        [javascript.fileName]: javascript,
         [css.fileName]: css,
       }),
     ).toThrow('generated class ".a" would collide with authored CSS');
@@ -151,9 +193,13 @@ describe("stylexMangleClassNames", () => {
   test("rewrites generated class names during Vite development transforms", async () => {
     const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
     await runConfigResolved(plugin, "serve");
+    const source = [
+      `inject({ ltr: ".${PREFIX}1{color:red}" });`,
+      `globalThis.className = "${PREFIX}1";`,
+    ].join("\n");
 
-    await expect(runTransform(plugin, `globalThis.className = "${PREFIX}1";`)).resolves.toEqual({
-      code: 'globalThis.className = "a";',
+    await expect(runTransform(plugin, source)).resolves.toEqual({
+      code: ['inject({ ltr: ".a{color:red}" });', 'globalThis.className = "a";'].join("\n"),
       map: null,
     });
   });
