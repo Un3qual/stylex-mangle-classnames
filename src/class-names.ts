@@ -20,8 +20,14 @@ function atomicClassPattern(classNamePrefix: string): RegExp {
 }
 
 function isStylexConstKey(source: string, classNameOffset: number): boolean {
-  return /\bconstKey\s*:\s*["'`]$/.test(
-    source.slice(Math.max(0, classNameOffset - 32), classNameOffset),
+  const keyOffset = source.lastIndexOf("constKey", classNameOffset);
+
+  if (keyOffset < 0 || /[A-Za-z0-9_$]/.test(source[keyOffset - 1] ?? "")) {
+    return false;
+  }
+
+  return /^\s*:\s*["'`]$/.test(
+    source.slice(keyOffset + "constKey".length, classNameOffset),
   );
 }
 

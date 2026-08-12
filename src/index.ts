@@ -12,12 +12,31 @@ export type StylexMangleClassNamesOptions = {
   classNamePrefix: string;
 };
 
+type TextOutput = {
+  output: Rollup.OutputAsset | Rollup.OutputChunk;
+  source: string;
+};
+
 function assetSourceToString(source: string | Uint8Array): string {
   return typeof source === "string" ? source : new TextDecoder().decode(source);
 }
 
 function isTextAsset(fileName: string): boolean {
   return /\.(?:css|html|js|mjs|cjs)$/.test(fileName);
+}
+
+function textOutputs(bundle: Rollup.OutputBundle): TextOutput[] {
+  const outputs: TextOutput[] = [];
+
+  for (const output of Object.values(bundle)) {
+    if (output.type === "chunk") {
+      outputs.push({ output, source: output.code });
+    } else if (isTextAsset(output.fileName)) {
+      outputs.push({ output, source: assetSourceToString(output.source) });
+    }
+  }
+
+  return outputs;
 }
 
 function authoredCssClasses(source: string): Set<string> {
@@ -83,13 +102,7 @@ export default function stylexMangleClassNames(
     }
   }
 
-  function remember(source: string): void {
-    for (const original of findStylexClassNames(source, classNamePrefix)) {
-      rememberClassName(original);
-    }
-  }
-
-  function rememberSources(sources: readonly string[]): void {
+  function registerClassNames(sources: readonly string[]): void {
     const originals = new Set<string>();
 
     for (const source of sources) {
@@ -120,42 +133,28 @@ export default function stylexMangleClassNames(
     }
   }
 
-  function rewrite(source: string): string {
-    remember(source);
-    return rewriteStylexClassNames(source, classNamePrefix, classNames).code;
-  }
-
   function rewriteBundle(this: Rollup.PluginContext, bundle: Rollup.OutputBundle): void {
-    const sources: string[] = [];
+    const outputs = textOutputs(bundle);
 
-    for (const output of Object.values(bundle)) {
-      const source =
-        output.type === "chunk"
-          ? output.code
-          : isTextAsset(output.fileName)
-            ? assetSourceToString(output.source)
-            : null;
+    registerClassNames(outputs.map(({ source }) => source));
+    assertNoAuthoredCssCollisions(
+      this,
+      outputs
+        .filter(({ output }) => output.type === "asset" && output.fileName.endsWith(".css"))
+        .map(({ source }) => source),
+    );
 
-      if (source !== null) {
-        sources.push(source);
+    for (const { output, source } of outputs) {
+      const result = rewriteStylexClassNames(source, classNamePrefix, classNames);
+
+      if (!result.changed) {
+        continue;
       }
-    }
 
-    rememberSources(sources);
-
-    const cssSources: string[] = [];
-    for (const output of Object.values(bundle)) {
-      if (output.type === "asset" && output.fileName.endsWith(".css")) {
-        cssSources.push(assetSourceToString(output.source));
-      }
-    }
-    assertNoAuthoredCssCollisions(this, cssSources);
-
-    for (const output of Object.values(bundle)) {
       if (output.type === "chunk") {
-        output.code = rewrite(output.code);
-      } else if (isTextAsset(output.fileName)) {
-        output.source = rewrite(assetSourceToString(output.source));
+        output.code = result.code;
+      } else {
+        output.source = result.code;
       }
     }
   }
@@ -186,7 +185,7 @@ export default function stylexMangleClassNames(
       })),
     );
 
-    rememberSources(files.map((file) => file.source));
+    registerClassNames(files.map(({ source }) => source));
     assertNoAuthoredCssCollisions(
       context,
       files.map((file) => file.source),
@@ -220,7 +219,7 @@ export default function stylexMangleClassNames(
         return null;
       }
 
-      remember(code);
+      registerClassNames([code]);
       const result = rewriteStylexClassNames(code, classNamePrefix, classNames);
 
       return result.changed ? { code: result.code, map: null } : null;

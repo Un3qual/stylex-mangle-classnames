@@ -9,11 +9,9 @@ const PREFIX = "sx";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
-  await Promise.all(
-    temporaryDirectories
-      .splice(0)
-      .map((directory) => rm(directory, { force: true, recursive: true })),
-  );
+  for (const directory of temporaryDirectories.splice(0)) {
+    await rm(directory, { force: true, recursive: true });
+  }
 });
 
 function virtualEntry(): Plugin {

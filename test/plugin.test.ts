@@ -112,9 +112,11 @@ describe("stylexMangleClassNames", () => {
 
   test("preserves StyleX constants, custom properties, keyframes, and unrelated classes", () => {
     const atomic = `${PREFIX}1dmbf1k`;
+    const spacedConstKey = `register({ constKey${" ".repeat(40)}:${" ".repeat(40)}"${atomic}" });`;
     const source = [
       `globalThis.className = "${atomic} product-card";`,
       `register({ constKey: "${atomic}", constVal: "red" });`,
+      spacedConstKey,
       `globalThis.variable = "--${atomic}";`,
       `globalThis.keyframes = "${atomic}-B";`,
     ].join("\n");
@@ -123,6 +125,7 @@ describe("stylexMangleClassNames", () => {
       [
         'globalThis.className = "a product-card";',
         `register({ constKey: "${atomic}", constVal: "red" });`,
+        spacedConstKey,
         `globalThis.variable = "--${atomic}";`,
         `globalThis.keyframes = "${atomic}-B";`,
       ].join("\n"),
