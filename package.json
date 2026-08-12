@@ -34,6 +34,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "check": "pnpm run typecheck && pnpm test && pnpm run build",
+    "prepare": "pnpm run build",
     "prepack": "pnpm run check",
     "version-packages": "changeset version"
   },

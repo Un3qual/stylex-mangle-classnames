@@ -2,7 +2,7 @@ import { readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { Plugin, ResolvedConfig, Rollup } from "vite";
 import {
-  findStylexClassNames,
+  findStylexClassNamesInRules,
   mangleStylexClassName,
   rewriteStylexClassNames,
 } from "./class-names.js";
@@ -106,7 +106,7 @@ export default function stylexMangleClassNames(
     const originals = new Set<string>();
 
     for (const source of sources) {
-      for (const original of findStylexClassNames(source, classNamePrefix)) {
+      for (const original of findStylexClassNamesInRules(source, classNamePrefix)) {
         originals.add(original);
       }
     }
@@ -121,12 +121,10 @@ export default function stylexMangleClassNames(
     sources: readonly string[],
   ): void {
     for (const source of sources) {
-      const originalNames = findStylexClassNames(source, classNamePrefix);
-
       for (const className of authoredCssClasses(source)) {
         const original = generatedNames.get(className);
 
-        if (original !== undefined && !originalNames.has(className)) {
+        if (original !== undefined) {
           context.error(collisionMessage(className, original));
         }
       }
@@ -136,7 +134,11 @@ export default function stylexMangleClassNames(
   function rewriteBundle(this: Rollup.PluginContext, bundle: Rollup.OutputBundle): void {
     const outputs = textOutputs(bundle);
 
-    registerClassNames(outputs.map(({ source }) => source));
+    registerClassNames(
+      outputs
+        .filter(({ output }) => output.type === "chunk")
+        .map(({ source }) => source),
+    );
     assertNoAuthoredCssCollisions(
       this,
       outputs
@@ -185,7 +187,6 @@ export default function stylexMangleClassNames(
       })),
     );
 
-    registerClassNames(files.map(({ source }) => source));
     assertNoAuthoredCssCollisions(
       context,
       files.map((file) => file.source),
