@@ -1,4 +1,4 @@
-# stylex-mangle-classnames
+# @un3qual/stylex-mangle-classnames
 
 [![CI](https://github.com/Un3qual/stylex-mangle-classnames/actions/workflows/ci.yml/badge.svg)](https://github.com/Un3qual/stylex-mangle-classnames/actions/workflows/ci.yml)
 
@@ -12,10 +12,10 @@ It rewrites matching class references consistently across emitted JavaScript, CS
 
 ## Install
 
-This package is not published to npm yet. After the first release, install it with:
+This package is ready for its first npm release. After `0.1.0` is published, install it with:
 
 ```sh
-pnpm add --save-dev stylex-mangle-classnames
+pnpm add --save-dev @un3qual/stylex-mangle-classnames
 ```
 
 `vite` is a peer dependency. The MVP supports Vite 5 through Vite 8 and is ESM-only.
@@ -33,7 +33,7 @@ import stylexPlugin from "@stylexjs/babel-plugin";
 import babel from "@rolldown/plugin-babel";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
-import stylexMangleClassNames from "stylex-mangle-classnames";
+import stylexMangleClassNames from "@un3qual/stylex-mangle-classnames";
 
 const classNamePrefix = "sx";
 
@@ -65,7 +65,7 @@ When StyleX uses `runtimeInjection: false`, configure a StyleX bundler plugin to
 import stylex from "@stylexjs/rollup-plugin";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
-import stylexMangleClassNames from "stylex-mangle-classnames";
+import stylexMangleClassNames from "@un3qual/stylex-mangle-classnames";
 
 const classNamePrefix = "sx";
 

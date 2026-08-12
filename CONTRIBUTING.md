@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve `stylex-mangle-classnames`.
+Thanks for helping improve `@un3qual/stylex-mangle-classnames`.
 
 ## Development setup
 
