@@ -1,0 +1,60 @@
+{
+  "name": "stylex-mangle-classnames",
+  "version": "0.1.0",
+  "description": "A Vite plugin that shortens generated StyleX atomic class names to a, b, ... z, aa, ab, and beyond.",
+  "packageManager": "pnpm@11.18.0",
+  "type": "module",
+  "sideEffects": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Un3qual/stylex-mangle-classnames.git"
+  },
+  "homepage": "https://github.com/Un3qual/stylex-mangle-classnames#readme",
+  "bugs": {
+    "url": "https://github.com/Un3qual/stylex-mangle-classnames/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "tsc -b tsconfig.build.json --clean && tsc -b tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm run typecheck && pnpm test && pnpm run build",
+    "prepack": "pnpm run check"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "vite": ">=5.0.0 <9.0.0"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "vite": "8.2.0",
+    "vitest": "4.1.8"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "stylex",
+    "vite",
+    "css",
+    "class-names",
+    "minify",
+    "mangle"
+  ]
+}

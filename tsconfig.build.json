@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "dist",
+    "rootDir": "src",
+    "sourceMap": true,
+    "tsBuildInfoFile": "./node_modules/.cache/stylex-mangle-classnames.tsbuildinfo",
+    "types": []
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["test", "vitest.config.ts"]
+}
