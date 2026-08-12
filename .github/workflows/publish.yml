@@ -20,12 +20,16 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: corepack enable
       - run: corepack install
-      - run: npm install --global npm@11.6.2
       - run: pnpm install --frozen-lockfile
+      - name: Verify OIDC availability
+        run: |
+          if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+            echo "::error::GitHub did not provide the OIDC environment required for npm trusted publishing"
+            exit 1
+          fi
       - name: Verify release tag
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
