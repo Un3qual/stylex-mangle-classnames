@@ -24,6 +24,10 @@ pnpm add --save-dev stylex-mangle-classnames
 
 Use one prefix for both the StyleX compiler and this plugin. The mangler must run after the plugin that compiles StyleX:
 
+### Runtime-injected CSS
+
+When StyleX uses `runtimeInjection: true`, its Babel plugin keeps the generated rules in JavaScript:
+
 ```ts
 import stylexPlugin from "@stylexjs/babel-plugin";
 import babel from "@rolldown/plugin-babel";
@@ -53,7 +57,34 @@ export default defineConfig({
 });
 ```
 
-The exact StyleX integration around the plugin can differ. The only shared contract is that `classNamePrefix` must exactly match the prefix used by the StyleX compiler.
+### Extracted CSS
+
+When StyleX uses `runtimeInjection: false`, configure a StyleX bundler plugin to extract the generated stylesheet:
+
+```ts
+import stylex from "@stylexjs/rollup-plugin";
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vite";
+import stylexMangleClassNames from "stylex-mangle-classnames";
+
+const classNamePrefix = "sx";
+
+export default defineConfig({
+  plugins: [
+    ...react(),
+    stylex({
+      classNamePrefix,
+      dev: process.env.NODE_ENV !== "production",
+      runtimeInjection: false,
+    }),
+    stylexMangleClassNames({ classNamePrefix }),
+  ],
+});
+```
+
+The mangler must appear after the StyleX extractor. Using the Babel plugin alone with `runtimeInjection: false` produces class references but no stylesheet for the mangler to process.
+
+Whichever StyleX integration you use, `classNamePrefix` must exactly match the prefix given to this plugin.
 
 ## API
 
