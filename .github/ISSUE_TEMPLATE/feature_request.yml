@@ -1,0 +1,50 @@
+name: Feature request
+description: Propose a focused improvement to the plugin
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: checkboxes
+    attributes:
+      label: Existing requests
+      options:
+        - label: I searched existing issues and did not find this request.
+          required: true
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: Describe the concrete workflow or problem this would improve.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-behavior
+    attributes:
+      label: Proposed behavior
+      description: Explain the smallest useful plugin behavior or API change.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds or other approaches you considered.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: Which plugin responsibility does this request primarily affect?
+      options:
+        - Class-name detection or rewriting
+        - Vite development integration
+        - Vite production integration
+        - Collision or safety behavior
+        - Package compatibility or developer experience
+    validations:
+      required: true
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
