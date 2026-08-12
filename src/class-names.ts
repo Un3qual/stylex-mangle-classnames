@@ -19,6 +19,14 @@ function atomicClassPattern(classNamePrefix: string): RegExp {
   );
 }
 
+function atomicClassSelectorPattern(classNamePrefix: string): RegExp {
+  const prefix = escapeRegularExpression(classNamePrefix);
+
+  return new RegExp(`\\.(${prefix}(?:0|[1-9a-z][0-9a-z]*))(?![${CSS_IDENTIFIER_CHARACTER}])`, "g");
+}
+
+const stylexRulePattern = /\b(?:ltr|rtl)\s*:\s*(?:`([^`]*)`|"((?:\\.|[^"\\])*)")/g;
+
 function isStylexConstKey(source: string, classNameOffset: number): boolean {
   const keyOffset = source.lastIndexOf("constKey", classNameOffset);
 
@@ -69,18 +77,26 @@ export function mangleStylexClassName(
   return mangled;
 }
 
-export function findStylexClassNames(source: string, classNamePrefix: string): Set<string> {
+export function findStylexClassNamesInRules(source: string, classNamePrefix: string): Set<string> {
   const classNames = new Set<string>();
 
-  for (const match of source.matchAll(atomicClassPattern(classNamePrefix))) {
-    const classNameOffset = match.index + match[1]!.length;
-
-    if (!isStylexConstKey(source, classNameOffset)) {
-      classNames.add(match[2]!);
+  for (const rule of findStylexRules(source)) {
+    for (const match of rule.matchAll(atomicClassSelectorPattern(classNamePrefix))) {
+      classNames.add(match[1]!);
     }
   }
 
   return classNames;
+}
+
+function findStylexRules(source: string): Set<string> {
+  const rules = new Set<string>();
+
+  for (const match of source.matchAll(stylexRulePattern)) {
+    rules.add(match[1] ?? JSON.parse(`"${match[2]}"`));
+  }
+
+  return rules;
 }
 
 export function rewriteStylexClassNames(
@@ -88,6 +104,10 @@ export function rewriteStylexClassNames(
   classNamePrefix: string,
   classNames: Map<string, string>,
 ): StylexRewriteResult {
+  if (classNames.size === 0) {
+    return { changed: false, code: source };
+  }
+
   let changed = false;
   const code = source.replace(
     atomicClassPattern(classNamePrefix),
@@ -98,9 +118,9 @@ export function rewriteStylexClassNames(
         return match;
       }
 
-      const mangled = mangleStylexClassName(className, classNamePrefix, classNames);
+      const mangled = classNames.get(className);
 
-      if (mangled === null) {
+      if (mangled === undefined) {
         return match;
       }
 

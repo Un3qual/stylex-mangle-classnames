@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Until the first npm release, only the latest commit on `main` is supported. After publication and while the package is below version 1.0, security fixes will target the latest minor release. Older pre-1.0 versions may not receive backports.
+While the package is below version 1.0, security fixes target the latest minor release. Older pre-1.0 versions may not receive backports.
 
 ## Reporting a vulnerability
 
