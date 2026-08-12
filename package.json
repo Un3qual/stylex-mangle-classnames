@@ -1,6 +1,6 @@
 {
   "name": "@un3qual/stylex-mangle-classnames",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A Vite plugin that shortens generated StyleX atomic class names to a, b, ... z, aa, ab, and beyond.",
   "packageManager": "pnpm@11.18.0",
   "type": "module",
