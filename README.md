@@ -90,7 +90,7 @@ pnpm run check
 pnpm pack --dry-run
 ```
 
-Maintainers should follow the bootstrap and automated release process in [CONTRIBUTING.md](./CONTRIBUTING.md#releases).
+Maintainers should follow the automated release process in [CONTRIBUTING.md](./CONTRIBUTING.md#releases).
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) before opening a pull request. Report security issues using the private process in [SECURITY.md](./SECURITY.md).
 

@@ -35,12 +35,11 @@ Changesets do not publish this package automatically.
 
 ## Releases
 
-### First npm release
+Publishing uses npm trusted publishing from `.github/workflows/publish.yml`. The repository does not store an npm publishing token.
 
-The initial `0.1.0` release bootstraps npm trusted publishing:
+Commit a Changeset with every user-visible change. When a release is ready:
 
-1. Confirm that you own or can publish public packages under the `@un3qual` npm scope.
-2. Run the complete local release checks:
+1. Run the complete local release checks:
 
    ```sh
    pnpm run check
@@ -49,29 +48,8 @@ The initial `0.1.0` release bootstraps npm trusted publishing:
    npm publish --dry-run --access public
    ```
 
-3. Authenticate locally with npm, then publish `0.1.0` exactly once:
-
-   ```sh
-   npm login
-   npm publish --access public
-   ```
-
-4. Configure [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) with these values:
-
-   - Provider: GitHub Actions
-   - Organization or user: `Un3qual`
-   - Repository: `stylex-mangle-classnames`
-   - Workflow filename: `publish.yml`
-   - Environment: `npm`
-   - Allowed action: `npm publish`
-
-5. Create the non-prerelease GitHub Release `v0.1.0`. The workflow recognizes that the exact version is already published and exits successfully.
-
-The repository does not store an npm publishing token.
-
-### Future releases
-
-Commit a Changeset with every user-visible change. When a release is ready, run `pnpm version-packages`, review the resulting package version and changelog, then commit and push those changes to `main`. Create a non-prerelease GitHub Release whose tag is exactly `v${package.json.version}`.
+2. Run `pnpm version-packages`, review the resulting package version and changelog, then commit and push those changes to `main`.
+3. Create a non-prerelease GitHub Release whose tag is exactly `v${package.json.version}`.
 
 The publishing workflow verifies and publishes that version through npm trusted publishing. It never selects or changes a version.
 
