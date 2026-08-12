@@ -1,5 +1,7 @@
 # stylex-mangle-classnames
 
+[![CI](https://github.com/Un3qual/stylex-mangle-classnames/actions/workflows/ci.yml/badge.svg)](https://github.com/Un3qual/stylex-mangle-classnames/actions/workflows/ci.yml)
+
 A small Vite plugin that shortens generated StyleX atomic class names to a contiguous alphabetic sequence:
 
 ```text
