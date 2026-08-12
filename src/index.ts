@@ -1,3 +1,5 @@
+import { readdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import type { Plugin, ResolvedConfig, Rollup } from "vite";
 import {
   findStylexClassNames,
@@ -34,6 +36,31 @@ function assertValidPrefix(classNamePrefix: string): void {
   }
 }
 
+async function cssFilesIn(directory: string): Promise<string[]> {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const files = await Promise.all(
+    entries.map(async (entry) => {
+      const absolutePath = resolve(directory, entry.name);
+
+      if (entry.isDirectory()) {
+        return cssFilesIn(absolutePath);
+      }
+
+      return entry.isFile() && entry.name.endsWith(".css") ? [absolutePath] : [];
+    }),
+  );
+
+  return files.flat().sort();
+}
+
+function outputDirectory(options: Rollup.NormalizedOutputOptions): string | null {
+  if (options.dir) {
+    return resolve(options.dir);
+  }
+
+  return options.file ? dirname(resolve(options.file)) : null;
+}
+
 /**
  * Shortens canonical StyleX atomic class names in Vite development transforms
  * and production output bundles.
@@ -62,13 +89,27 @@ export default function stylexMangleClassNames(
     }
   }
 
+  function rememberSources(sources: readonly string[]): void {
+    const originals = new Set<string>();
+
+    for (const source of sources) {
+      for (const original of findStylexClassNames(source, classNamePrefix)) {
+        originals.add(original);
+      }
+    }
+
+    for (const original of [...originals].sort()) {
+      rememberClassName(original);
+    }
+  }
+
   function rewrite(source: string): string {
     remember(source);
     return rewriteStylexClassNames(source, classNamePrefix, classNames).code;
   }
 
   function rewriteBundle(this: Rollup.PluginContext, bundle: Rollup.OutputBundle): void {
-    const originals = new Set<string>();
+    const sources: string[] = [];
 
     for (const output of Object.values(bundle)) {
       const source =
@@ -79,15 +120,11 @@ export default function stylexMangleClassNames(
             : null;
 
       if (source !== null) {
-        for (const original of findStylexClassNames(source, classNamePrefix)) {
-          originals.add(original);
-        }
+        sources.push(source);
       }
     }
 
-    for (const original of [...originals].sort()) {
-      rememberClassName(original);
-    }
+    rememberSources(sources);
 
     for (const output of Object.values(bundle)) {
       if (output.type !== "asset" || !output.fileName.endsWith(".css")) {
@@ -113,6 +150,44 @@ export default function stylexMangleClassNames(
         output.source = rewrite(assetSourceToString(output.source));
       }
     }
+  }
+
+  async function rewriteLateCss(
+    outputOptions: Rollup.NormalizedOutputOptions,
+    bundle: Rollup.OutputBundle,
+  ): Promise<void> {
+    const directory = outputDirectory(outputOptions);
+
+    if (directory === null) {
+      return;
+    }
+
+    const bundledCssFiles = new Set(
+      Object.values(bundle)
+        .filter((output) => output.type === "asset" && output.fileName.endsWith(".css"))
+        .map((output) => resolve(directory, output.fileName)),
+    );
+    const fileNames = (await cssFilesIn(directory)).filter(
+      (fileName) => !bundledCssFiles.has(fileName),
+    );
+    const files = await Promise.all(
+      fileNames.map(async (fileName) => ({
+        fileName,
+        source: await readFile(fileName, "utf8"),
+      })),
+    );
+
+    rememberSources(files.map((file) => file.source));
+
+    await Promise.all(
+      files.map(async ({ fileName, source }) => {
+        const result = rewriteStylexClassNames(source, classNamePrefix, classNames);
+
+        if (result.changed) {
+          await writeFile(fileName, result.code, "utf8");
+        }
+      }),
+    );
   }
 
   return {
@@ -141,6 +216,12 @@ export default function stylexMangleClassNames(
       order: "post",
       handler(_outputOptions, bundle) {
         rewriteBundle.call(this, bundle);
+      },
+    },
+    writeBundle: {
+      order: "post",
+      async handler(outputOptions, bundle) {
+        await rewriteLateCss(outputOptions, bundle);
       },
     },
   };
