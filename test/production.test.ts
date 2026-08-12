@@ -87,4 +87,10 @@ describe("production output", () => {
     expect(output.javascript).toContain('globalThis.className = "a";');
     expect(output.css).toBe(".a{color:red}");
   });
+
+  test("fails before rewriting late CSS that collides with an authored class", async () => {
+    await expect(buildWithLateCss(`.${PREFIX}1{color:red}.a{color:blue}`)).rejects.toThrow(
+      'generated class ".a" would collide with authored CSS',
+    );
+  });
 });

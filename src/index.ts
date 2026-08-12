@@ -103,6 +103,23 @@ export default function stylexMangleClassNames(
     }
   }
 
+  function assertNoAuthoredCssCollisions(
+    context: Rollup.PluginContext,
+    sources: readonly string[],
+  ): void {
+    for (const source of sources) {
+      const originalNames = findStylexClassNames(source, classNamePrefix);
+
+      for (const className of authoredCssClasses(source)) {
+        const original = generatedNames.get(className);
+
+        if (original !== undefined && !originalNames.has(className)) {
+          context.error(collisionMessage(className, original));
+        }
+      }
+    }
+  }
+
   function rewrite(source: string): string {
     remember(source);
     return rewriteStylexClassNames(source, classNamePrefix, classNames).code;
@@ -126,22 +143,13 @@ export default function stylexMangleClassNames(
 
     rememberSources(sources);
 
+    const cssSources: string[] = [];
     for (const output of Object.values(bundle)) {
-      if (output.type !== "asset" || !output.fileName.endsWith(".css")) {
-        continue;
-      }
-
-      const source = assetSourceToString(output.source);
-      const originalNames = findStylexClassNames(source, classNamePrefix);
-
-      for (const className of authoredCssClasses(source)) {
-        const original = generatedNames.get(className);
-
-        if (original !== undefined && !originalNames.has(className)) {
-          this.error(collisionMessage(className, original));
-        }
+      if (output.type === "asset" && output.fileName.endsWith(".css")) {
+        cssSources.push(assetSourceToString(output.source));
       }
     }
+    assertNoAuthoredCssCollisions(this, cssSources);
 
     for (const output of Object.values(bundle)) {
       if (output.type === "chunk") {
@@ -153,6 +161,7 @@ export default function stylexMangleClassNames(
   }
 
   async function rewriteLateCss(
+    context: Rollup.PluginContext,
     outputOptions: Rollup.NormalizedOutputOptions,
     bundle: Rollup.OutputBundle,
   ): Promise<void> {
@@ -178,6 +187,10 @@ export default function stylexMangleClassNames(
     );
 
     rememberSources(files.map((file) => file.source));
+    assertNoAuthoredCssCollisions(
+      context,
+      files.map((file) => file.source),
+    );
 
     await Promise.all(
       files.map(async ({ fileName, source }) => {
@@ -221,7 +234,7 @@ export default function stylexMangleClassNames(
     writeBundle: {
       order: "post",
       async handler(outputOptions, bundle) {
-        await rewriteLateCss(outputOptions, bundle);
+        await rewriteLateCss(this, outputOptions, bundle);
       },
     },
   };
