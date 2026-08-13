@@ -43,7 +43,7 @@ export default defineConfig({
 });
 ```
 
-The mangler identifies an extracted class only when the emitted CSS selector has a matching class reference in JavaScript or HTML. This avoids treating every prefix-shaped selector as generated StyleX output.
+Ensure the application emits a CSS asset, for example by importing an application stylesheet. Current `@stylexjs/unplugin` builds append extracted StyleX rules to that asset during `generateBundle`, where the mangler can rewrite them before output is written. Its fallback stylesheet, used when the build has no CSS asset, is written later and cannot be mangled without invalidating finalized output metadata.
 
 ### Runtime-injected CSS
 
@@ -68,8 +68,7 @@ stylexMangleClassNames({ classNamePrefix: string }): Plugin
 
 ## Behavior
 
-- Runtime-injected classes are discovered from emitted StyleX `ltr` and `rtl` rules.
-- Extracted classes are discovered from matching emitted CSS selectors and JavaScript or HTML references.
+- Generated classes are discovered from compiled StyleX style objects and runtime `ltr` or `rtl` rules before chunks are rendered.
 - Only canonical lowercase base-36 StyleX class names are shortened.
 - Runtime `constKey` registrations, CSS custom properties, keyframe suffixes, unrelated classes, and unrelated application data remain unchanged.
 - One deterministic mapping is used for the complete class set in each output bundle.
@@ -83,6 +82,7 @@ Short names are build artifacts. Do not persist them or depend on a specific Sty
 - Vite 5 through Vite 8.
 - ESM projects.
 - Extracted and runtime-injected StyleX output.
+- Extracted builds must emit a CSS asset before `writeBundle`; the `@stylexjs/unplugin` fallback stylesheet used by CSS-free builds is not rewritten.
 - Client and SSR builds that contain the same generated StyleX class set. Independently executed builds with different class sets may assign different short names because mappings are not shared across build processes.
 
 ## Development

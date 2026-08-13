@@ -4,9 +4,9 @@
 
 **Goal:** Mangle current StyleX extracted and runtime-injected output while preserving accurate Vite production source maps and presenting the package in direct user-facing language.
 
-**Architecture:** Discover runtime-generated classes from `ltr`/`rtl` rule objects and extracted classes from the intersection of emitted CSS selectors and non-CSS class references. Represent replacements as offset edits so JavaScript rewrites can produce a high-resolution map, then compose that edit map with Vite's chunk map. Apply the same discovery and rewrite pipeline to files emitted by earlier `writeBundle` hooks.
+**Architecture:** Discover generated classes from compiled StyleX style objects and runtime `ltr`/`rtl` rules during JavaScript transforms. Sort the complete set before rendering, rewrite JavaScript in `renderChunk`, and return a high-resolution edit map for Rollup to compose. Rewrite bundled CSS and HTML assets in `generateBundle`.
 
-**Tech Stack:** TypeScript, Vite/Rollup plugin hooks, MagicString, source-map composition, Vitest, pnpm.
+**Tech Stack:** TypeScript, Vite/Rollup plugin hooks, MagicString, Vitest, pnpm.
 
 ## Global Constraints
 
@@ -28,12 +28,12 @@
 - Test: `test/production.test.ts`
 
 **Interfaces:**
-- Consumes: emitted JavaScript, HTML, and CSS strings plus `classNamePrefix`.
-- Produces: selector and reference discovery functions that return canonical prefixed class-name sets; bundle registration uses their intersection plus runtime rule discoveries.
+- Consumes: compiled JavaScript plus `classNamePrefix`.
+- Produces: exact generated class-name sets from compiled StyleX style objects and runtime rules.
 
 - [ ] **Step 1: Write failing bundle tests**
 
-Add tests showing that a class present in both an emitted CSS selector and a JavaScript or HTML reference is rewritten in every output without an `ltr`/`rtl` rule. Add paired preservation tests for a CSS-only selector and a reference-only application value. Add a collision test in which extracted StyleX CSS and a separate authored short selector coexist.
+Add tests showing that classes in compiled StyleX style objects are rewritten in JavaScript, CSS, and HTML without an `ltr`/`rtl` rule. Add preservation tests for prefix-shaped selectors and application values that are not part of compiled StyleX output. Add a collision test in which extracted StyleX CSS and a separate authored short selector coexist.
 
 - [ ] **Step 2: Run the focused tests and confirm expected failures**
 
@@ -41,15 +41,15 @@ Run: `corepack pnpm vitest run test/plugin.test.ts`
 
 Expected: extracted-output assertions fail because registration currently reads only JavaScript `ltr`/`rtl` rules.
 
-- [ ] **Step 3: Implement corroborated discovery**
+- [ ] **Step 3: Implement compiled-output discovery**
 
-Expose focused helpers in `src/class-names.ts` for canonical selector discovery and exact non-CSS reference discovery. In `src/index.ts`, register the sorted union of runtime-rule classes and the intersection of CSS selectors with non-CSS references before rewriting outputs. Exclude the corroborating generated selectors from authored-CSS collision checks while retaining failures for separate authored short selectors.
+Expose a helper in `src/class-names.ts` that reads generated class values only from compiled StyleX objects marked `$$css: true`. In `src/index.ts`, collect those classes together with runtime-rule classes during JavaScript transforms and register the sorted union before chunk rendering.
 
 - [ ] **Step 4: Run focused and full tests**
 
 Run: `corepack pnpm vitest run test/plugin.test.ts test/production.test.ts`
 
-Expected: all discovery, preservation, collision, development, and late-CSS tests pass.
+Expected: all discovery, preservation, collision, development, and bundled-CSS tests pass.
 
 - [ ] **Step 5: Commit**
 
@@ -70,8 +70,8 @@ git commit -m "feat: support extracted StyleX output"
 - Test: `test/production.test.ts`
 
 **Interfaces:**
-- Consumes: ordered class-name replacement offsets, rewritten chunk code, and `Rollup.SourceMap`.
-- Produces: rewritten code and a composed `Rollup.SourceMap` that maps generated positions through the class-name edit to the original source.
+- Consumes: ordered class-name replacement offsets and rendered chunk code.
+- Produces: rewritten code and an edit map that Rollup composes with earlier source maps.
 
 - [ ] **Step 1: Write failing production source-map tests**
 
@@ -85,13 +85,13 @@ Expected: configuration rejects enabled source maps.
 
 - [ ] **Step 3: Add explicit map dependencies**
 
-Run: `corepack pnpm add magic-string @ampproject/remapping`
+Run: `corepack pnpm add magic-string`
 
-Use `magic-string` to generate edit maps and `@ampproject/remapping` to compose them with existing chunk maps. Keep both as runtime dependencies because the published plugin imports them.
+Use `magic-string` to generate edit maps. Keep it as a runtime dependency because the published plugin imports it.
 
 - [ ] **Step 4: Implement edit-map generation and composition**
 
-Change class-name rewriting to retain exact replacement offsets. Add `src/source-maps.ts` to apply those edits with MagicString and compose the generated edit map over the existing Vite/Rollup map. Remove the `configResolved` source-map rejection and assign the composed map to rewritten chunks during `generateBundle`.
+Change class-name rewriting to retain exact replacement offsets. Add `src/source-maps.ts` to apply those edits with MagicString. Return the edit map from `renderChunk` so Rollup composes and serializes it. Remove the `configResolved` source-map rejection.
 
 - [ ] **Step 5: Run focused and full tests**
 
@@ -106,7 +106,7 @@ git add package.json pnpm-lock.yaml src/class-names.ts src/index.ts src/source-m
 git commit -m "fix: preserve production source maps"
 ```
 
-### Task 3: Late extracted CSS and serialized source maps
+### Task 3: Pre-hash rewriting and source-map edge cases
 
 **Files:**
 - Modify: `src/index.ts`
@@ -114,22 +114,22 @@ git commit -m "fix: preserve production source maps"
 - Test: `test/production.test.ts`
 
 **Interfaces:**
-- Consumes: emitted output-directory files, late CSS selector sets, existing mapping state, external or inline JavaScript source maps.
-- Produces: mutually consistent on-disk JavaScript, HTML, CSS, and JavaScript map files after a late StyleX stylesheet introduces generated classes.
+- Consumes: the complete transformed class set and rendered JavaScript chunks.
+- Produces: rewritten chunks whose filenames, integrity metadata, and source maps describe the final code.
 
-- [ ] **Step 1: Write a failing late-CSS integration test**
+- [ ] **Step 1: Write failing output-lifecycle tests**
 
-Build extracted output in which JavaScript contains a canonical StyleX class reference, no runtime rule is present, and an earlier `writeBundle` hook writes the matching stylesheet. Enable an external source map. Assert that late CSS and JavaScript both use the short class and that the JavaScript position traces to the original virtual module.
+Build two outputs in which a class added to a separate chunk changes the bundle-wide mapping for an otherwise unchanged entry. Assert that the rewritten entry filename changes with its contents. Add regressions for a short name that is also a canonical source name, inline source-map text in application code, and missing `sourcesContent`.
 
 - [ ] **Step 2: Run the integration test and confirm the expected failure**
 
 Run: `corepack pnpm vitest run test/production.test.ts`
 
-Expected: CSS and JavaScript remain unmangled or become inconsistent because late CSS is not part of bundle discovery.
+Expected: the entry filename remains unchanged, a second pass merges distinct classes, or source-map serialization loses input data.
 
-- [ ] **Step 3: Implement the on-disk rewrite path**
+- [ ] **Step 3: Move rewriting before output finalization**
 
-Read late CSS and emitted bundle text before registering new classes. When registration grows, rewrite all relevant output files on disk. For JavaScript, load external or inline maps, compose the edit map, write the updated code/map representation, and preserve hidden-map behavior. Keep collision validation ahead of writes.
+Collect generated classes during transforms, register the complete sorted set in `renderStart`, and rewrite JavaScript in `renderChunk`. Remove the on-disk `writeBundle` pass and manual inline/external map serialization. Keep CSS and HTML rewriting in `generateBundle` and limit CSS parsing to selector preludes.
 
 - [ ] **Step 4: Run focused and full tests**
 
@@ -137,13 +137,13 @@ Run: `corepack pnpm vitest run test/production.test.ts`
 
 Run: `corepack pnpm test`
 
-Expected: all tests pass and late extracted output remains internally consistent.
+Expected: all tests pass and output metadata matches the final rewritten chunks.
 
 - [ ] **Step 5: Commit**
 
 ```sh
 git add src/index.ts src/source-maps.ts test/production.test.ts
-git commit -m "fix: rewrite late extracted StyleX output"
+git commit -m "fix: finalize mangling before chunk hashing"
 ```
 
 ### Task 4: Direct user-facing documentation

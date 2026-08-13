@@ -9,6 +9,17 @@ All notable changes to this project are documented in this file. The format foll
 - Support for extracted StyleX output without requiring `runtimeInjection: true`.
 - Accurate production JavaScript source maps for Vite's external, hidden, and inline modes.
 
+### Fixed
+
+- Rewrite JavaScript before chunk hashes and source-map output are finalized.
+- Preserve missing source content and inline source-map text in application code.
+- Avoid a second mangling pass over written bundle files.
+- Limit CSS class discovery and collision checks to selector preludes.
+
+### Changed
+
+- Extracted builds must provide a bundled CSS asset; stylesheets created only during `writeBundle` are left unchanged.
+
 ## 0.1.1
 
 ### Patch Changes

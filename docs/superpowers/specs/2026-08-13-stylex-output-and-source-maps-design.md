@@ -16,26 +16,21 @@ Support class-name mangling for both runtime-injected and extracted StyleX outpu
 
 Runtime-injected output retains the existing rule-based discovery. A canonical prefixed class found in an emitted StyleX `ltr` or `rtl` rule is registered as generated.
 
-Extracted output uses corroborated discovery. A canonical prefixed class is registered only when it appears both:
+Extracted output is discovered from the generated class values in compiled StyleX style objects. This is emitted program output rather than private state from the StyleX plugin, and it distinguishes generated classes from unrelated prefix-shaped strings without waiting for CSS assets.
 
-1. as a selector in emitted CSS; and
-2. as an exact class reference in emitted JavaScript, HTML, or another non-CSS text output.
+Discovery runs across transformed JavaScript modules before rendering. The complete class set is sorted once, then JavaScript chunks are rewritten in `renderChunk` so content hashes incorporate the final code. CSS and HTML assets already present in the output bundle are rewritten in `generateBundle`.
 
-This supports the current `@stylexjs/unplugin` Vite flow without treating every prefix-shaped selector as StyleX. A prefix-shaped authored selector with no matching emitted reference remains unchanged, and a prefix-shaped application value with no matching emitted CSS selector remains unchanged.
-
-Discovery runs across the complete output bundle before any replacements, so every output uses one deterministic mapping. CSS written by an earlier `writeBundle` hook is also eligible for corroborated discovery against the already-emitted non-CSS bundle output. When late CSS adds newly discovered classes, the plugin rewrites the emitted JavaScript, HTML, CSS, and JavaScript source-map files on disk as one operation.
+Extracted builds must provide a CSS asset for `@stylexjs/unplugin` to update during `generateBundle`. Its CSS-free fallback is written during `writeBundle`, after chunk hashes and related metadata are final, so that fallback is left unchanged.
 
 ## Rewriting and Collisions
 
 Only registered generated classes are rewritten. Runtime `constKey` registrations, CSS custom-property names, keyframe suffixes, unrelated authored classes, and unrelated application data remain unchanged.
 
-Collision detection distinguishes StyleX selectors used to corroborate extracted output from authored CSS. A generated short name still causes a build failure when that name already appears as a separate authored selector.
+Collision detection scans CSS selector preludes rather than declarations, strings, or comments. Registered canonical StyleX selectors are excluded; a generated short name still causes a build failure when that name already appears as a separate authored selector.
 
 ## Production Source Maps
 
-Class-name edits to JavaScript chunks produce a high-resolution edit map. The edit map is composed with the chunk's existing Rollup/Vite map so generated positions continue to resolve to the original source files.
-
-The plugin updates the chunk map before Rollup serializes it. If late StyleX CSS requires an on-disk rewrite, it applies the same edit-map composition to the emitted chunk and rewrites the serialized map. This applies to Vite's supported source-map modes:
+Class-name edits to JavaScript chunks produce a high-resolution edit map from `renderChunk`. Rollup composes that map with preceding transforms and serializes the result, so generated positions continue to resolve to the original source files. This applies to Vite's supported source-map modes:
 
 - `true`: an external map and source-map comment;
 - `"hidden"`: an external map without a source-map comment; and
@@ -54,12 +49,12 @@ Repository documentation will avoid conversational filler, release-process narra
 Automated tests will cover:
 
 - runtime-injected rule discovery;
-- extracted CSS discovery from matching CSS selectors and emitted references;
+- extracted CSS discovery from compiled StyleX style objects;
 - preservation of uncorroborated prefix-shaped CSS and application data;
 - collision detection with extracted output;
 - source-map modes `true`, `"hidden"`, and `"inline"`;
 - mapping a rewritten generated position back to the original source position;
-- late-emitted extracted CSS together with its JavaScript references and source map; and
+- hashed chunk filenames, inline map text, and missing source content; and
 - the existing development and production behavior.
 
 The full `pnpm run check` and `pnpm pack --dry-run` commands must pass before completion.
