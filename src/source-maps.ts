@@ -26,8 +26,9 @@ function rollupSourceMap(map: RemappedSourceMap): Rollup.SourceMap {
     mappings: map.mappings,
     names: map.names,
     sources: map.sources.map((source) => source ?? ""),
-    sourcesContent: (map.sourcesContent ?? []).map((content) => content ?? ""),
+    sourcesContent: map.sources.map((_, index) => map.sourcesContent?.[index] ?? ""),
     version: map.version,
+    ...(map.ignoreList ? { x_google_ignoreList: map.ignoreList } : {}),
   };
 
   return {
