@@ -7,6 +7,13 @@ export type HtmlStartTag = {
   tagName: string;
 };
 
+export type HtmlAttribute = {
+  name: string;
+  value?: string;
+  valueEnd?: number;
+  valueStart?: number;
+};
+
 const rawTextTagNames = new Set(["script", "style", "textarea", "title"]);
 
 function findStartTagEnd(source: string, start: number): number | null {
@@ -94,4 +101,89 @@ export function findHtmlStartTags(source: string): HtmlStartTag[] {
   }
 
   return tags;
+}
+
+export function findHtmlAttributes(tag: HtmlStartTag): HtmlAttribute[] {
+  const attributes: HtmlAttribute[] = [];
+  const tagName = /^<[A-Za-z][A-Za-z\d:-]*/.exec(tag.source)?.[0];
+
+  if (tagName === undefined) {
+    return attributes;
+  }
+
+  let index = tagName.length;
+
+  while (index < tag.source.length) {
+    while (/\s/.test(tag.source.charAt(index))) {
+      index += 1;
+    }
+
+    if (index >= tag.source.length || /[/>]/.test(tag.source.charAt(index))) {
+      break;
+    }
+
+    const nameStart = index;
+
+    while (
+      index < tag.source.length &&
+      !/[\s=/>]/.test(tag.source.charAt(index))
+    ) {
+      index += 1;
+    }
+
+    const name = tag.source.slice(nameStart, index).toLowerCase();
+
+    while (/\s/.test(tag.source.charAt(index))) {
+      index += 1;
+    }
+
+    if (tag.source.charAt(index) !== "=") {
+      attributes.push({ name });
+      continue;
+    }
+
+    index += 1;
+
+    while (/\s/.test(tag.source.charAt(index))) {
+      index += 1;
+    }
+
+    const quote = tag.source.charAt(index);
+
+    if (quote === "\"" || quote === "'") {
+      const valueStart = index + 1;
+      const valueEnd = tag.source.indexOf(quote, valueStart);
+
+      if (valueEnd < 0) {
+        break;
+      }
+
+      attributes.push({
+        name,
+        value: tag.source.slice(valueStart, valueEnd),
+        valueEnd,
+        valueStart,
+      });
+      index = valueEnd + 1;
+      continue;
+    }
+
+    const valueStart = index;
+
+    while (
+      index < tag.source.length &&
+      !/[\s>]/.test(tag.source.charAt(index))
+    ) {
+      index += 1;
+    }
+
+    attributes.push({
+      name,
+      value: tag.source.slice(valueStart, index),
+      valueEnd: index,
+      valueStart,
+    });
+  }
+
+  return attributes;
 }

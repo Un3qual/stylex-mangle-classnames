@@ -1061,6 +1061,63 @@ describe("stylexMangleClassNames", () => {
     });
   });
 
+  test("composes finalized dependency filename edits into CSS source maps", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const resolved = outputOptionsResult(plugin, {
+      assetFileNames: "assets/[name]-[hash][extname]",
+    });
+
+    if (typeof resolved.assetFileNames !== "function") {
+      throw new Error("Expected an asset filename callback");
+    }
+
+    const preliminaryImageFileName = materializeHashPlaceholders(
+      resolved.assetFileNames({
+        name: "image.png",
+        source: "image",
+        type: "asset",
+      } as Rollup.PreRenderedAsset),
+      "image000",
+    )
+      .replace("[name]", "image")
+      .replace("[extname]", ".png");
+    const image = outputAsset(preliminaryImageFileName, "image");
+    const cssSource = `a{background:url("${preliminaryImageFileName}")}.tail{color:red}\n/*# sourceMappingURL=styles.css.map */`;
+    const tailColumn = cssSource.indexOf(".tail");
+    const sourceMap = new SourceMapGenerator({ file: "styles.css" });
+
+    for (const column of [0, tailColumn]) {
+      sourceMap.addMapping({
+        generated: { column, line: 1 },
+        original: { column, line: 1 },
+        source: "styles-source.css",
+      });
+    }
+
+    sourceMap.setSourceContent("styles-source.css", cssSource);
+    const css = outputAsset("styles.css", cssSource);
+    const map = outputAsset("styles.css.map", sourceMap.toString());
+
+    runGenerateBundle(plugin, {
+      [css.fileName]: css,
+      [image.fileName]: image,
+      [map.fileName]: map,
+    });
+
+    const rewrittenCss = String(css.source);
+    const rewrittenTailColumn = rewrittenCss.indexOf(".tail");
+    const originalPosition = new SourceMapConsumer(
+      JSON.parse(String(map.source)) as RawSourceMap,
+    ).originalPositionFor({ column: rewrittenTailColumn, line: 1 });
+
+    expect(rewrittenCss).toContain(`url("${image.fileName}")`);
+    expect(originalPosition).toMatchObject({
+      column: tailColumn,
+      line: 1,
+      source: "styles-source.css",
+    });
+  });
+
   test("fails instead of overwriting outputs when short hashes collide", () => {
     const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
     const resolved = outputOptionsResult(plugin, {
@@ -1566,6 +1623,48 @@ describe("stylexMangleClassNames", () => {
     expect(html.source).toBe('<div title="1 > 0" class="a"></div>');
   });
 
+  test("does not rewrite class-like text inside another HTML attribute", () => {
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    );
+    const css = outputAsset("styles.css", `.${PREFIX}1{color:red}`);
+    const html = outputAsset(
+      "index.html",
+      `<div title=" class=${PREFIX}1 "></div>`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [css.fileName]: css,
+      [html.fileName]: html,
+      [javascript.fileName]: javascript,
+    });
+
+    expect(html.source).toBe(`<div title=" class=${PREFIX}1 "></div>`);
+  });
+
+  test("does not rewrite generated-name substrings inside Unicode class tokens", () => {
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    );
+    const css = outputAsset(
+      "styles.css",
+      `.${PREFIX}1{color:red}.é${PREFIX}1{color:blue}`,
+    );
+    const html = outputAsset(
+      "index.html",
+      `<div class="é${PREFIX}1 ${PREFIX}1"></div>`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [css.fileName]: css,
+      [html.fileName]: html,
+      [javascript.fileName]: javascript,
+    });
+
+    expect(css.source).toBe(`.a{color:red}.é${PREFIX}1{color:blue}`);
+    expect(html.source).toBe(`<div class="é${PREFIX}1 a"></div>`);
+  });
+
   test("preserves prefix-shaped application data without a matching CSS selector", () => {
     const javascript = outputChunk(`globalThis.productId = "${PREFIX}123";`);
 
@@ -1621,6 +1720,21 @@ describe("stylexMangleClassNames", () => {
     const css = outputAsset(
       "styles.css",
       `.${PREFIX}1{color:red}@scope (.a) {.child{color:blue}}`,
+    );
+
+    expect(() =>
+      runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+        [javascript.fileName]: javascript,
+        [css.fileName]: css,
+      }),
+    ).toThrow('generated class ".a" would collide with authored CSS');
+  });
+
+  test("detects an authored class collision in a class attribute selector", () => {
+    const javascript = outputChunk(`inject({ ltr: ".${PREFIX}1{color:red}" });`);
+    const css = outputAsset(
+      "styles.css",
+      `.${PREFIX}1{color:red}[class~="a"]{color:blue}`,
     );
 
     expect(() =>

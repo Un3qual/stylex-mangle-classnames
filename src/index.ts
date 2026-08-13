@@ -332,6 +332,50 @@ function javascriptFileNameReferenceEdits(
   return edits;
 }
 
+function cssFileNameReferenceEdits(
+  value: string,
+  replacements: ReadonlyMap<string, string>,
+): StylexClassNameEdit[] {
+  const edits: StylexClassNameEdit[] = [];
+
+  function addEdit(start: number, end: number, token: string): void {
+    if (edits.some((edit) => start < edit.end && end > edit.start)) {
+      return;
+    }
+
+    const replacement = replaceFileNameReference(token, replacements);
+
+    if (replacement !== token) {
+      edits.push({ end, replacement, start });
+    }
+  }
+
+  for (const token of quotedTokens(value)) {
+    addEdit(token.start, token.end, token.value);
+  }
+
+  for (const match of value.matchAll(/\burl\(\s*([^"')\s][^)]*?)\s*\)/gi)) {
+    const token = match[1];
+
+    if (token !== undefined) {
+      const start = match.index + match[0].indexOf(token);
+      addEdit(start, start + token.length, token);
+    }
+  }
+
+  for (const match of value.matchAll(/((?:sourceMappingURL|sourceURL)=)([^\s*]+)/g)) {
+    const prefix = match[1] ?? "";
+    const token = match[2];
+
+    if (token !== undefined) {
+      const start = match.index + prefix.length;
+      addEdit(start, start + token.length, token);
+    }
+  }
+
+  return edits;
+}
+
 function applyTextEdits(
   value: string,
   edits: readonly StylexClassNameEdit[],
@@ -1322,6 +1366,20 @@ function updateOutputFileNameReferences(
           output.source,
           replacements,
         );
+      } else if (output.fileName.endsWith(".css")) {
+        const edits = cssFileNameReferenceEdits(
+          output.source,
+          replacements,
+        );
+        updatedSource =
+          edits.length === 0
+            ? output.source
+            : rewriteCssWithSourceMap(
+                bundle,
+                output,
+                output.source,
+                edits,
+              );
       } else if (/\.(?:cjs|js|mjs)$/.test(output.fileName)) {
         const edits = javascriptFileNameReferenceEdits(
           output.source,

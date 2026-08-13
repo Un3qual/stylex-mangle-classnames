@@ -1,8 +1,8 @@
 import postcss from "postcss";
-import { findHtmlStartTags } from "./html.js";
+import { findHtmlAttributes, findHtmlStartTags } from "./html.js";
 
 const SHORT_CLASS_NAME_ALPHABET = "abcdefghijklmnopqrstuvwxyz";
-const CSS_IDENTIFIER_CHARACTER = "A-Za-z0-9_-";
+const CSS_IDENTIFIER_CHARACTER = String.raw`\p{ID_Continue}-`;
 
 export type StylexRewriteResult = {
   changed: boolean;
@@ -30,14 +30,14 @@ function atomicClassPattern(classNamePrefix: string): RegExp {
 
   return new RegExp(
     `(^|[^${CSS_IDENTIFIER_CHARACTER}])(${prefix}(?:0|[1-9a-z][0-9a-z]*))(?![${CSS_IDENTIFIER_CHARACTER}])`,
-    "g",
+    "gu",
   );
 }
 
 function atomicClassSelectorPattern(classNamePrefix: string): RegExp {
   const prefix = escapeRegularExpression(classNamePrefix);
 
-  return new RegExp(`\\.(${prefix}(?:0|[1-9a-z][0-9a-z]*))(?![${CSS_IDENTIFIER_CHARACTER}])`, "g");
+  return new RegExp(`\\.(${prefix}(?:0|[1-9a-z][0-9a-z]*))(?![${CSS_IDENTIFIER_CHARACTER}])`, "gu");
 }
 
 const cssEscapePattern = String.raw`\\(?:[0-9A-Fa-f]{1,6}[ \t\r\n\f]?|[^\r\n\f])`;
@@ -48,6 +48,10 @@ const cssIdentifierRestPattern =
 const classSelectorPattern = new RegExp(
   String.raw`\.(${cssIdentifierStartPattern}${cssIdentifierRestPattern})`,
   "g",
+);
+const classAttributeSelectorPattern = new RegExp(
+  String.raw`\[\s*class\s*([~|^$*]?=)\s*(?:"((?:${cssEscapePattern}|[^"\\])*)"|'((?:${cssEscapePattern}|[^'\\])*)'|(${cssIdentifierStartPattern}${cssIdentifierRestPattern}))\s*([iIsS])?\s*\]`,
+  "gi",
 );
 
 const stylexRulePattern = /\b(?:ltr|rtl)\s*:\s*(?:`([^`]*)`|"((?:\\.|[^"\\])*)")/g;
@@ -64,8 +68,11 @@ function selectorClassText(selector: string): string {
     const nextCharacter = selector[index + 1];
 
     if (comment) {
+      result += " ";
+
       if (character === "*" && nextCharacter === "/") {
         comment = false;
+        result += " ";
         index += 1;
       }
 
@@ -73,6 +80,8 @@ function selectorClassText(selector: string): string {
     }
 
     if (quote !== null) {
+      result += " ";
+
       if (escaped) {
         escaped = false;
       } else if (character === "\\") {
@@ -86,7 +95,7 @@ function selectorClassText(selector: string): string {
 
     if (character === "/" && nextCharacter === "*") {
       comment = true;
-      result += " ";
+      result += "  ";
       index += 1;
     } else if (character === '"' || character === "'") {
       quote = character;
@@ -99,6 +108,8 @@ function selectorClassText(selector: string): string {
       result += " ";
     } else if (bracketDepth === 0) {
       result += character;
+    } else {
+      result += " ";
     }
   }
 
@@ -126,6 +137,53 @@ function decodeCssIdentifier(identifier: string): string {
       return String.fromCodePoint(codePoint);
     },
   );
+}
+
+type SelectorClassToken = {
+  decoded: string;
+  end: number;
+  start: number;
+};
+
+function selectorClassTokens(selector: string): SelectorClassToken[] {
+  const tokens: SelectorClassToken[] = [];
+
+  for (const match of selectorClassText(selector).matchAll(classSelectorPattern)) {
+    const identifier = match[1];
+
+    if (identifier === undefined) {
+      continue;
+    }
+
+    const start = match.index + 1;
+    tokens.push({
+      decoded: decodeCssIdentifier(identifier),
+      end: start + identifier.length,
+      start,
+    });
+  }
+
+  for (const match of selector.matchAll(classAttributeSelectorPattern)) {
+    const value = match[2] ?? match[3] ?? match[4];
+
+    if (value === undefined) {
+      continue;
+    }
+
+    const valueStart = match.index + match[0].indexOf(value);
+
+    for (const token of value.matchAll(/\S+/g)) {
+      const raw = token[0];
+      const decoded = decodeCssIdentifier(raw);
+      tokens.push({
+        decoded: match[5]?.toLowerCase() === "i" ? decoded.toLowerCase() : decoded,
+        end: valueStart + token.index + raw.length,
+        start: valueStart + token.index,
+      });
+    }
+  }
+
+  return tokens;
 }
 
 function isStylexConstKey(source: string, classNameOffset: number): boolean {
@@ -244,7 +302,15 @@ function findClassNamesInSelectors(
 }
 
 export function findCssClassNamesInSelectors(source: string): Set<string> {
-  return findClassNamesInSelectors(source, classSelectorPattern, decodeCssIdentifier);
+  const classNames = new Set<string>();
+
+  for (const fragment of cssSelectorFragments(source)) {
+    for (const token of selectorClassTokens(fragment.source)) {
+      classNames.add(token.decoded);
+    }
+  }
+
+  return classNames;
 }
 
 export function findStylexClassNamesInSelectors(
@@ -438,17 +504,23 @@ function applyStylexClassNameEdits(
 
 export function rewriteStylexClassNamesInCssSelectors(
   source: string,
-  classNamePrefix: string,
+  _classNamePrefix: string,
   classNames: Map<string, string>,
 ): StylexRewriteResult {
   const edits = cssSelectorFragments(source).flatMap((fragment) =>
-    rewriteStylexClassNames(fragment.source, classNamePrefix, classNames).edits.map(
-      (edit) => ({
-        ...edit,
-        end: fragment.start + edit.end,
-        start: fragment.start + edit.start,
-      }),
-    ),
+    selectorClassTokens(fragment.source).flatMap((token) => {
+      const replacement = classNames.get(token.decoded);
+
+      return replacement === undefined
+        ? []
+        : [
+            {
+              end: fragment.start + token.end,
+              replacement,
+              start: fragment.start + token.start,
+            },
+          ];
+    }),
   );
 
   return {
@@ -457,9 +529,6 @@ export function rewriteStylexClassNamesInCssSelectors(
     edits,
   };
 }
-
-const htmlClassAttributePattern =
-  /(\sclass\s*=\s*)(?:(["'])((?:(?!\2)[^\r\n])*)\2|([^\s"'`=<>]+))/gi;
 
 function inlineCssFragmentsInHtml(source: string): SourceFragment[] {
   const fragments: SourceFragment[] = [];
@@ -494,28 +563,25 @@ export function rewriteStylexClassNamesInHtml(
   const edits: StylexClassNameEdit[] = [];
 
   for (const tag of findHtmlStartTags(source)) {
-    const startTag = tag.source;
-
-    for (const attributeMatch of startTag.matchAll(htmlClassAttributePattern)) {
-      const value = attributeMatch[3] ?? attributeMatch[4];
-
-      if (value === undefined) {
+    for (const attribute of findHtmlAttributes(tag)) {
+      if (
+        attribute.name !== "class" ||
+        attribute.value === undefined ||
+        attribute.valueStart === undefined
+      ) {
         continue;
       }
 
-      const prefix = attributeMatch[1] ?? "";
-      const quote = attributeMatch[2] ?? "";
-      const valueStart =
-        tag.start + attributeMatch.index + prefix.length + quote.length;
-      const rewrite = rewriteStylexClassNames(value, classNamePrefix, classNames);
+      for (const token of attribute.value.matchAll(/\S+/g)) {
+        const replacement = classNames.get(token[0]);
 
-      edits.push(
-        ...rewrite.edits.map((edit) => ({
-          ...edit,
-          end: valueStart + edit.end,
-          start: valueStart + edit.start,
-        })),
-      );
+        if (replacement === undefined) {
+          continue;
+        }
+
+        const start = tag.start + attribute.valueStart + token.index;
+        edits.push({ end: start + token[0].length, replacement, start });
+      }
     }
   }
 
