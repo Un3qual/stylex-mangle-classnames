@@ -453,6 +453,148 @@ describe("stylexMangleClassNames", () => {
     expect(compatibleEntry.referencedFiles).toEqual([css.fileName]);
   });
 
+  test("rewrites generated class names in JavaScript emitted as an asset", () => {
+    const chunk = outputChunk(
+      [
+        `inject({ ltr: ".${PREFIX}1{color:red}" });`,
+        `globalThis.chunkClass = "${PREFIX}1";`,
+      ].join("\n"),
+    );
+    const asset = outputAsset(
+      "worker.js",
+      `globalThis.workerClass = "${PREFIX}1";`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [chunk.fileName]: chunk,
+      [asset.fileName]: asset,
+    });
+
+    expect(asset.source).toBe('globalThis.workerClass = "a";');
+  });
+
+  test("updates finalized chunk filenames inside inline source maps", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const resolved = outputOptionsResult(plugin, {
+      entryFileNames: "assets/[name]-[hash].js",
+    });
+
+    if (typeof resolved.entryFileNames !== "function") {
+      throw new Error("Expected an entry filename callback");
+    }
+
+    const preliminaryFileName = materializeHashPlaceholders(
+      resolved.entryFileNames({ name: "entry" } as Rollup.PreRenderedChunk),
+      "native00",
+    ).replace("[name]", "entry");
+    const sourceMap = Buffer.from(
+      JSON.stringify({
+        file: preliminaryFileName,
+        mappings: "",
+        names: [],
+        sources: ["entry.ts"],
+        version: 3,
+      }),
+    ).toString("base64");
+    const chunk = outputChunk(
+      `globalThis.value = 1;\n//# sourceMappingURL=data:application/json;base64,${sourceMap}`,
+    );
+    chunk.fileName = preliminaryFileName;
+    const bundle = { [preliminaryFileName]: chunk };
+
+    runGenerateBundle(plugin, bundle);
+
+    const encodedMap = chunk.code.match(
+      /sourceMappingURL=data:application\/json;base64,([^\n]+)/,
+    )?.[1];
+
+    if (encodedMap === undefined) {
+      throw new Error("Expected an inline source map");
+    }
+
+    const finalizedMap = JSON.parse(
+      Buffer.from(encodedMap, "base64").toString("utf8"),
+    ) as { file: string };
+
+    expect(chunk.fileName).not.toBe(preliminaryFileName);
+    expect(finalizedMap.file).toBe(chunk.fileName);
+  });
+
+  test("fails instead of overwriting outputs when short hashes collide", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const resolved = outputOptionsResult(plugin, {
+      chunkFileNames: "chunks/[hash:1].js",
+    });
+
+    if (typeof resolved.chunkFileNames !== "function") {
+      throw new Error("Expected a chunk filename callback");
+    }
+
+    const bundle: Rollup.OutputBundle = {};
+
+    for (let index = 0; index < 65; index += 1) {
+      const preliminaryFileName = materializeHashPlaceholders(
+        resolved.chunkFileNames({ name: `chunk-${index}` } as Rollup.PreRenderedChunk),
+        "a",
+      );
+      const chunk = outputChunk(`globalThis.value = ${index};`);
+      chunk.fileName = preliminaryFileName;
+      bundle[preliminaryFileName] = chunk;
+    }
+
+    expect(() => runGenerateBundle(plugin, bundle)).toThrow(
+      /finalized output filename collision/,
+    );
+    expect(Object.keys(bundle)).toHaveLength(65);
+  });
+
+  test("keeps output hashes stable when unrelated marker allocation changes", () => {
+    function targetFileName(includeUnrelated: boolean): string {
+      const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+      const resolved = outputOptionsResult(plugin, {
+        assetFileNames: "assets/[name]-[hash][extname]",
+      });
+
+      if (typeof resolved.assetFileNames !== "function") {
+        throw new Error("Expected an asset filename callback");
+      }
+
+      const bundle: Rollup.OutputBundle = {};
+
+      if (includeUnrelated) {
+        const unrelatedName = materializeHashPlaceholders(
+          resolved.assetFileNames({
+            name: "unrelated.txt",
+            source: "unrelated",
+            type: "asset",
+          } as Rollup.PreRenderedAsset),
+          "native00",
+        )
+          .replace("[name]", "unrelated")
+          .replace("[extname]", ".txt");
+        bundle[unrelatedName] = outputAsset(unrelatedName, "unrelated");
+      }
+
+      const targetName = materializeHashPlaceholders(
+        resolved.assetFileNames({
+          name: "target.txt",
+          source: "target",
+          type: "asset",
+        } as Rollup.PreRenderedAsset),
+        "native00",
+      )
+        .replace("[name]", "target")
+        .replace("[extname]", ".txt");
+      const target = outputAsset(targetName, "target");
+      bundle[targetName] = target;
+
+      runGenerateBundle(plugin, bundle);
+      return target.fileName;
+    }
+
+    expect(targetFileName(true)).toBe(targetFileName(false));
+  });
+
   test("rehashes every chunk in a circular dependency group", () => {
     function finalize(firstSource: string): [string, string] {
       const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });

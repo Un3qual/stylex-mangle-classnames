@@ -42,16 +42,19 @@ type CompatibleOutputChunk = Rollup.OutputChunk & {
   referencedFiles?: string[];
 };
 
+type OutputFile = Rollup.OutputChunk | Rollup.OutputAsset;
+
 const sourceMapDirectivePattern = /\/\*[#@]\s*sourceMappingURL=([^\s*]+)\s*\*\/\s*$/;
 const javascriptSourceMapDirectivePattern =
   /\/\/[#@]\s*sourceMappingURL=([^\s]+)\s*$/;
+const hashMarkerSentinelPattern = /__STYLEX_HASH_[0-9a-z]+_[0-9a-z]+__/g;
 
 function assetSourceToString(source: string | Uint8Array): string {
   return typeof source === "string" ? source : new TextDecoder().decode(source);
 }
 
 function isTextAsset(fileName: string): boolean {
-  return /\.(?:css|html)$/.test(fileName);
+  return /\.(?:cjs|css|html|js|mjs)$/.test(fileName);
 }
 
 function textAssets(bundle: Rollup.OutputBundle): TextAsset[] {
@@ -268,6 +271,530 @@ function rewriteCssWithSourceMap(
   return rewrite.code;
 }
 
+function requiredMapValue<Key, Value>(
+  map: ReadonlyMap<Key, Value>,
+  key: Key,
+  description: string,
+): Value {
+  const value = map.get(key);
+
+  if (value === undefined) {
+    throw new Error(`stylex-mangle-classnames: missing ${description}`);
+  }
+
+  return value;
+}
+
+function metadataValues(output: OutputFile): string[] {
+  if (output.type !== "chunk") {
+    return [];
+  }
+
+  const compatible = output as CompatibleOutputChunk;
+
+  return [
+    ...(output.imports ?? []),
+    ...(output.dynamicImports ?? []),
+    ...(compatible.implicitlyLoadedBefore ?? []),
+    ...(compatible.referencedFiles ?? []),
+    ...(output.sourcemapFileName === null || output.sourcemapFileName === undefined
+      ? []
+      : [output.sourcemapFileName]),
+  ];
+}
+
+function textValue(output: OutputFile): string | null {
+  if (output.type === "chunk") {
+    return output.code;
+  }
+
+  return typeof output.source === "string" ? output.source : null;
+}
+
+function markersInFileName(
+  fileName: string,
+  markers: ReadonlyMap<string, HashMarker>,
+): HashMarker[] {
+  return (fileName.match(hashMarkerSentinelPattern) ?? []).flatMap((sentinel) => {
+    const marker = markers.get(sentinel);
+    return marker === undefined ? [] : [marker];
+  });
+}
+
+function neutralizeHashMarkers(
+  fileName: string,
+  markers: ReadonlyMap<string, HashMarker>,
+): string {
+  const zeroHashes = new Map(
+    markersInFileName(fileName, markers).map(({ length, sentinel }) => [
+      sentinel,
+      "0".repeat(length),
+    ]),
+  );
+
+  return replaceHashMarkers(fileName, zeroHashes, markers);
+}
+
+function addFileNameReplacement(
+  replacements: Map<string, string>,
+  before: string,
+  after: string,
+): void {
+  replacements.set(before, after);
+  const beforeBaseName = posix.basename(before);
+
+  if (beforeBaseName !== before) {
+    replacements.set(beforeBaseName, posix.basename(after));
+  }
+}
+
+function replaceInlineSourceMapFileNameReferences(
+  value: string,
+  replacements: ReadonlyMap<string, string>,
+): string {
+  const directive =
+    value.match(javascriptSourceMapDirectivePattern) ??
+    value.match(sourceMapDirectivePattern);
+  const sourceMapUrl = directive?.[1];
+
+  if (sourceMapUrl?.startsWith("data:application/json") !== true) {
+    return value;
+  }
+
+  const commaIndex = sourceMapUrl.indexOf(",");
+
+  if (commaIndex < 0) {
+    return value;
+  }
+
+  const prefix = sourceMapUrl.slice(0, commaIndex + 1);
+  const encodedMap = sourceMapUrl.slice(commaIndex + 1);
+  const isBase64 = /;base64,$/i.test(prefix);
+
+  try {
+    const sourceMap = isBase64
+      ? Buffer.from(encodedMap, "base64").toString("utf8")
+      : decodeURIComponent(encodedMap);
+    const updatedMap = replaceFileNameReferences(sourceMap, replacements);
+
+    if (updatedMap === sourceMap) {
+      return value;
+    }
+
+    const updatedEncodedMap = isBase64
+      ? Buffer.from(updatedMap).toString("base64")
+      : encodeURIComponent(updatedMap);
+
+    return value.replace(sourceMapUrl, `${prefix}${updatedEncodedMap}`);
+  } catch {
+    return value;
+  }
+}
+
+function normalizeFileNameReferences(
+  value: string,
+  externalReplacements: ReadonlyMap<string, string>,
+  internalReplacements: ReadonlyMap<string, string>,
+): string {
+  const replacements = new Map([
+    ...externalReplacements,
+    ...internalReplacements,
+  ]);
+  const updatedValue = replaceFileNameReferences(value, replacements);
+
+  return replaceInlineSourceMapFileNameReferences(updatedValue, replacements);
+}
+
+function outputDependencies(
+  outputs: readonly OutputFile[],
+  preliminaryFileNames: ReadonlyMap<OutputFile, string>,
+  markers: ReadonlyMap<string, HashMarker>,
+): Map<OutputFile, Set<OutputFile>> {
+  const outputBySentinel = new Map<string, OutputFile>();
+
+  for (const output of outputs) {
+    const fileName = requiredMapValue(
+      preliminaryFileNames,
+      output,
+      "preliminary output filename",
+    );
+
+    for (const marker of markersInFileName(fileName, markers)) {
+      outputBySentinel.set(marker.sentinel, output);
+    }
+  }
+
+  return new Map(
+    outputs.map((output) => {
+      const dependencies = new Set<OutputFile>();
+      const values = [textValue(output) ?? "", ...metadataValues(output)];
+
+      for (const value of values) {
+        for (const sentinel of value.match(hashMarkerSentinelPattern) ?? []) {
+          const dependency = outputBySentinel.get(sentinel);
+
+          if (dependency !== undefined) {
+            dependencies.add(dependency);
+          }
+        }
+      }
+
+      return [output, dependencies] as const;
+    }),
+  );
+}
+
+function stronglyConnectedOutputGroups(
+  outputs: readonly OutputFile[],
+  dependencies: ReadonlyMap<OutputFile, ReadonlySet<OutputFile>>,
+): OutputFile[][] {
+  const indices = new Map<OutputFile, number>();
+  const lowLinks = new Map<OutputFile, number>();
+  const stack: OutputFile[] = [];
+  const onStack = new Set<OutputFile>();
+  const groups: OutputFile[][] = [];
+  let nextIndex = 0;
+
+  function connect(output: OutputFile): void {
+    indices.set(output, nextIndex);
+    lowLinks.set(output, nextIndex);
+    nextIndex += 1;
+    stack.push(output);
+    onStack.add(output);
+
+    for (const dependency of dependencies.get(output) ?? []) {
+      if (!indices.has(dependency)) {
+        connect(dependency);
+        lowLinks.set(
+          output,
+          Math.min(
+            requiredMapValue(lowLinks, output, "output low link"),
+            requiredMapValue(lowLinks, dependency, "dependency low link"),
+          ),
+        );
+      } else if (onStack.has(dependency)) {
+        lowLinks.set(
+          output,
+          Math.min(
+            requiredMapValue(lowLinks, output, "output low link"),
+            requiredMapValue(indices, dependency, "dependency index"),
+          ),
+        );
+      }
+    }
+
+    if (
+      requiredMapValue(lowLinks, output, "output low link") !==
+      requiredMapValue(indices, output, "output index")
+    ) {
+      return;
+    }
+
+    const group: OutputFile[] = [];
+    let member: OutputFile;
+
+    do {
+      const popped = stack.pop();
+
+      if (popped === undefined) {
+        throw new Error("stylex-mangle-classnames: invalid output dependency graph");
+      }
+
+      member = popped;
+      onStack.delete(member);
+      group.push(member);
+    } while (member !== output);
+
+    groups.push(group);
+  }
+
+  for (const output of outputs) {
+    if (!indices.has(output)) {
+      connect(output);
+    }
+  }
+
+  return groups;
+}
+
+function stableOutputKey(
+  output: OutputFile,
+  preliminaryFileNames: ReadonlyMap<OutputFile, string>,
+  markers: ReadonlyMap<string, HashMarker>,
+): string {
+  const fileName = requiredMapValue(
+    preliminaryFileNames,
+    output,
+    "preliminary output filename",
+  );
+  const outputName =
+    output.type === "chunk"
+      ? output.name
+      : ((output as Rollup.OutputAsset & { name?: string }).name ?? "");
+
+  return JSON.stringify([
+    neutralizeHashMarkers(fileName, markers),
+    output.type,
+    outputName,
+  ]);
+}
+
+function computeFinalFileNames(
+  outputs: readonly OutputFile[],
+  preliminaryFileNames: ReadonlyMap<OutputFile, string>,
+  dependencies: ReadonlyMap<OutputFile, ReadonlySet<OutputFile>>,
+  groups: readonly (readonly OutputFile[])[],
+  markers: ReadonlyMap<string, HashMarker>,
+  hashCharacters: HashCharacters,
+): Map<OutputFile, string> {
+  const groupByOutput = new Map<OutputFile, number>();
+
+  groups.forEach((group, groupIndex) => {
+    for (const output of group) {
+      groupByOutput.set(output, groupIndex);
+    }
+  });
+
+  const hashes = new Map<string, string>();
+  const finalFileNames = new Map<OutputFile, string>();
+  const completedGroups = new Set<number>();
+
+  function computeGroup(groupIndex: number): void {
+    if (completedGroups.has(groupIndex)) {
+      return;
+    }
+
+    const group = groups[groupIndex];
+
+    if (group === undefined) {
+      throw new Error("stylex-mangle-classnames: missing output dependency group");
+    }
+
+    const groupSet = new Set(group);
+
+    for (const output of group) {
+      for (const dependency of dependencies.get(output) ?? []) {
+        const dependencyGroup = requiredMapValue(
+          groupByOutput,
+          dependency,
+          "dependency group",
+        );
+
+        if (dependencyGroup !== groupIndex) {
+          computeGroup(dependencyGroup);
+        }
+      }
+    }
+
+    const externalReplacements = new Map<string, string>();
+    const internalReplacements = new Map<string, string>();
+    const orderedGroup = [...group].sort((left, right) =>
+      stableOutputKey(left, preliminaryFileNames, markers).localeCompare(
+        stableOutputKey(right, preliminaryFileNames, markers),
+      ),
+    );
+
+    for (const output of outputs) {
+      const finalFileName = finalFileNames.get(output);
+
+      if (finalFileName !== undefined && !groupSet.has(output)) {
+        addFileNameReplacement(
+          externalReplacements,
+          requiredMapValue(
+            preliminaryFileNames,
+            output,
+            "preliminary output filename",
+          ),
+          finalFileName,
+        );
+      }
+    }
+
+    orderedGroup.forEach((output, memberIndex) => {
+      addFileNameReplacement(
+        internalReplacements,
+        requiredMapValue(
+          preliminaryFileNames,
+          output,
+          "preliminary output filename",
+        ),
+        `__STYLEX_INTERNAL_${memberIndex}__`,
+      );
+    });
+
+    const groupSeed = orderedGroup
+      .map((output) => {
+        const fileName = requiredMapValue(
+          preliminaryFileNames,
+          output,
+          "preliminary output filename",
+        );
+        const outputMarkers = markersInFileName(fileName, markers);
+        const nativeHashes = outputMarkers.map(
+          (marker) => nativeHashForMarker(fileName, marker) ?? "",
+        );
+        const source =
+          output.type === "asset" && typeof output.source !== "string"
+            ? `binary:${Buffer.from(output.source).toString("base64")}`
+            : normalizeFileNameReferences(
+                textValue(output) ?? "",
+                externalReplacements,
+                internalReplacements,
+              );
+        const metadata = metadataValues(output).map((value) =>
+          normalizeFileNameReferences(
+            value,
+            externalReplacements,
+            internalReplacements,
+          ),
+        );
+
+        return JSON.stringify({
+          fileName: neutralizeHashMarkers(fileName, markers),
+          metadata,
+          nativeHashes,
+          source,
+          type: output.type,
+        });
+      })
+      .join("\0");
+
+    orderedGroup.forEach((output, memberIndex) => {
+      const fileName = requiredMapValue(
+        preliminaryFileNames,
+        output,
+        "preliminary output filename",
+      );
+
+      markersInFileName(fileName, markers).forEach((marker, markerIndex) => {
+        hashes.set(
+          marker.sentinel,
+          contentHash(
+            `${groupSeed}\0${memberIndex}\0${markerIndex}`,
+            hashCharacters,
+          ).slice(0, marker.length),
+        );
+      });
+    });
+
+    for (const output of orderedGroup) {
+      const preliminaryFileName = requiredMapValue(
+        preliminaryFileNames,
+        output,
+        "preliminary output filename",
+      );
+      finalFileNames.set(
+        output,
+        replaceHashMarkers(preliminaryFileName, hashes, markers),
+      );
+    }
+
+    completedGroups.add(groupIndex);
+  }
+
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+    computeGroup(groupIndex);
+  }
+
+  return finalFileNames;
+}
+
+function assertUniqueFinalFileNames(
+  outputs: readonly OutputFile[],
+  finalFileNames: ReadonlyMap<OutputFile, string>,
+): void {
+  const outputByFileName = new Map<string, OutputFile>();
+
+  for (const output of outputs) {
+    const fileName = finalFileNames.get(output) ?? output.fileName;
+
+    if (outputByFileName.has(fileName)) {
+      throw new Error(
+        `stylex-mangle-classnames: finalized output filename collision for "${fileName}"; increase the configured [hash] length`,
+      );
+    }
+
+    outputByFileName.set(fileName, output);
+  }
+}
+
+function updateOutputFileNameReferences(
+  outputs: readonly OutputFile[],
+  replacements: ReadonlyMap<string, string>,
+): void {
+  for (const output of outputs) {
+    if (output.type === "chunk") {
+      const updatedCode = replaceFileNameReferences(output.code, replacements);
+      output.code = replaceInlineSourceMapFileNameReferences(
+        updatedCode,
+        replacements,
+      );
+      output.imports = (output.imports ?? []).map((value) =>
+        replaceFileNameReferences(value, replacements),
+      );
+      output.dynamicImports = (output.dynamicImports ?? []).map((value) =>
+        replaceFileNameReferences(value, replacements),
+      );
+      const compatible = output as CompatibleOutputChunk;
+
+      if (compatible.implicitlyLoadedBefore !== undefined) {
+        compatible.implicitlyLoadedBefore = compatible.implicitlyLoadedBefore.map(
+          (value) => replaceFileNameReferences(value, replacements),
+        );
+      }
+
+      if (compatible.referencedFiles !== undefined) {
+        compatible.referencedFiles = compatible.referencedFiles.map((value) =>
+          replaceFileNameReferences(value, replacements),
+        );
+      }
+
+      if (output.sourcemapFileName !== null && output.sourcemapFileName !== undefined) {
+        output.sourcemapFileName = replaceFileNameReferences(
+          output.sourcemapFileName,
+          replacements,
+        );
+      }
+    } else if (typeof output.source === "string") {
+      const updatedSource = replaceFileNameReferences(output.source, replacements);
+      output.source = replaceInlineSourceMapFileNameReferences(
+        updatedSource,
+        replacements,
+      );
+    }
+  }
+}
+
+function rekeyOutputBundle(
+  bundle: Rollup.OutputBundle,
+  entries: readonly (readonly [string, OutputFile])[],
+): void {
+  const canRekeyBundle = entries.every(([, output]) => {
+    const descriptor = Object.getOwnPropertyDescriptor(
+      output,
+      output.type === "chunk" ? "code" : "source",
+    );
+
+    return descriptor?.get === undefined;
+  });
+
+  if (!canRekeyBundle) {
+    return;
+  }
+
+  for (const [bundleKey, output] of entries) {
+    if (bundleKey !== output.fileName) {
+      Reflect.deleteProperty(bundle, bundleKey);
+    }
+  }
+
+  for (const [bundleKey, output] of entries) {
+    if (bundleKey !== output.fileName) {
+      bundle[output.fileName] = output;
+    }
+  }
+}
+
 function finalizeOutputHashMarkers(
   bundle: Rollup.OutputBundle,
   hashCharacters: HashCharacters,
@@ -285,330 +812,45 @@ function finalizeOutputHashMarkers(
   const preliminaryFileNames = new Map(
     outputValues.map((output) => [output, output.fileName] as const),
   );
-  const dependencies = new Map<
-    Rollup.OutputChunk | Rollup.OutputAsset,
-    Set<Rollup.OutputChunk | Rollup.OutputAsset>
-  >();
+  const dependencies = outputDependencies(
+    outputValues,
+    preliminaryFileNames,
+    markers,
+  );
+  const groups = stronglyConnectedOutputGroups(outputValues, dependencies);
+  const finalFileNames = computeFinalFileNames(
+    outputValues,
+    preliminaryFileNames,
+    dependencies,
+    groups,
+    markers,
+    hashCharacters,
+  );
 
-  function metadataValues(output: Rollup.OutputChunk | Rollup.OutputAsset): string[] {
-    if (output.type !== "chunk") {
-      return [];
-    }
-
-    const compatible = output as CompatibleOutputChunk;
-
-    return [
-      ...(output.imports ?? []),
-      ...(output.dynamicImports ?? []),
-      ...(compatible.implicitlyLoadedBefore ?? []),
-      ...(compatible.referencedFiles ?? []),
-      ...(output.sourcemapFileName === null || output.sourcemapFileName === undefined
-        ? []
-        : [output.sourcemapFileName]),
-    ];
-  }
-
-  function textValue(output: Rollup.OutputChunk | Rollup.OutputAsset): string | null {
-    if (output.type === "chunk") {
-      return output.code;
-    }
-
-    return typeof output.source === "string" ? output.source : null;
-  }
-
-  for (const output of outputValues) {
-    const values = [textValue(output) ?? "", ...metadataValues(output)];
-    const referencedOutputs = new Set<Rollup.OutputChunk | Rollup.OutputAsset>();
-
-    for (const candidate of outputValues) {
-      const fileName = preliminaryFileNames.get(candidate)!;
-      const baseName = posix.basename(fileName);
-
-      if (values.some((value) => value.includes(fileName) || value.includes(baseName))) {
-        referencedOutputs.add(candidate);
-      }
-    }
-
-    dependencies.set(output, referencedOutputs);
-  }
-
-  const indices = new Map<Rollup.OutputChunk | Rollup.OutputAsset, number>();
-  const lowLinks = new Map<Rollup.OutputChunk | Rollup.OutputAsset, number>();
-  const stack: (Rollup.OutputChunk | Rollup.OutputAsset)[] = [];
-  const onStack = new Set<Rollup.OutputChunk | Rollup.OutputAsset>();
-  const groups: (Rollup.OutputChunk | Rollup.OutputAsset)[][] = [];
-  let nextIndex = 0;
-
-  function connect(output: Rollup.OutputChunk | Rollup.OutputAsset): void {
-    indices.set(output, nextIndex);
-    lowLinks.set(output, nextIndex);
-    nextIndex += 1;
-    stack.push(output);
-    onStack.add(output);
-
-    for (const dependency of dependencies.get(output) ?? []) {
-      if (!indices.has(dependency)) {
-        connect(dependency);
-        lowLinks.set(
-          output,
-          Math.min(lowLinks.get(output)!, lowLinks.get(dependency)!),
-        );
-      } else if (onStack.has(dependency)) {
-        lowLinks.set(
-          output,
-          Math.min(lowLinks.get(output)!, indices.get(dependency)!),
-        );
-      }
-    }
-
-    if (lowLinks.get(output) !== indices.get(output)) {
-      return;
-    }
-
-    const group: (Rollup.OutputChunk | Rollup.OutputAsset)[] = [];
-    let member: Rollup.OutputChunk | Rollup.OutputAsset;
-
-    do {
-      member = stack.pop()!;
-      onStack.delete(member);
-      group.push(member);
-    } while (member !== output);
-
-    groups.push(group);
-  }
-
-  for (const output of outputValues) {
-    if (!indices.has(output)) {
-      connect(output);
-    }
-  }
-
-  const groupByOutput = new Map<Rollup.OutputChunk | Rollup.OutputAsset, number>();
-
-  groups.forEach((group, groupIndex) => {
-    for (const output of group) {
-      groupByOutput.set(output, groupIndex);
-    }
-  });
-
-  const hashes = new Map<string, string>();
-  const finalFileNames = new Map<Rollup.OutputChunk | Rollup.OutputAsset, string>();
-  const completedGroups = new Set<number>();
-
-  function addReplacement(
-    replacements: Map<string, string>,
-    before: string,
-    after: string,
-  ): void {
-    replacements.set(before, after);
-    const beforeBaseName = posix.basename(before);
-
-    if (beforeBaseName !== before) {
-      replacements.set(beforeBaseName, posix.basename(after));
-    }
-  }
-
-  function normalizeValue(
-    value: string,
-    externalReplacements: ReadonlyMap<string, string>,
-    internalReplacements: ReadonlyMap<string, string>,
-  ): string {
-    return replaceFileNameReferences(
-      replaceFileNameReferences(value, externalReplacements),
-      internalReplacements,
-    );
-  }
-
-  function computeGroup(groupIndex: number): void {
-    if (completedGroups.has(groupIndex)) {
-      return;
-    }
-
-    const group = groups[groupIndex]!;
-    const groupSet = new Set(group);
-
-    for (const output of group) {
-      for (const dependency of dependencies.get(output) ?? []) {
-        const dependencyGroup = groupByOutput.get(dependency)!;
-
-        if (dependencyGroup !== groupIndex) {
-          computeGroup(dependencyGroup);
-        }
-      }
-    }
-
-    const externalReplacements = new Map<string, string>();
-    const internalReplacements = new Map<string, string>();
-    const orderedGroup = [...group].sort((left, right) =>
-      preliminaryFileNames.get(left)!.localeCompare(preliminaryFileNames.get(right)!),
-    );
-
-    for (const output of outputValues) {
-      const finalFileName = finalFileNames.get(output);
-
-      if (finalFileName !== undefined && !groupSet.has(output)) {
-        addReplacement(
-          externalReplacements,
-          preliminaryFileNames.get(output)!,
-          finalFileName,
-        );
-      }
-    }
-
-    orderedGroup.forEach((output, memberIndex) => {
-      addReplacement(
-        internalReplacements,
-        preliminaryFileNames.get(output)!,
-        `__STYLEX_INTERNAL_${memberIndex}__`,
-      );
-    });
-
-    const groupSeed = orderedGroup
-      .map((output) => {
-        const fileName = preliminaryFileNames.get(output)!;
-        const outputMarkers = [...markers.values()].filter(({ sentinel }) =>
-          fileName.includes(sentinel),
-        );
-        const nativeHashes = outputMarkers.map(
-          (marker) => nativeHashForMarker(fileName, marker) ?? "",
-        );
-        const source =
-          output.type === "asset" && typeof output.source !== "string"
-            ? `binary:${Buffer.from(output.source).toString("base64")}`
-            : normalizeValue(
-                textValue(output) ?? "",
-                externalReplacements,
-                internalReplacements,
-              );
-        const metadata = metadataValues(output).map((value) =>
-          normalizeValue(value, externalReplacements, internalReplacements),
-        );
-        const zeroHashes = new Map(
-          outputMarkers.map(({ length, sentinel }) => [
-            sentinel,
-            "0".repeat(length),
-          ]),
-        );
-
-        return JSON.stringify({
-          fileName: replaceHashMarkers(fileName, zeroHashes, markers),
-          metadata,
-          nativeHashes,
-          source,
-          type: output.type,
-        });
-      })
-      .join("\0");
-
-    orderedGroup.forEach((output, memberIndex) => {
-      const fileName = preliminaryFileNames.get(output)!;
-
-      for (const marker of markers.values()) {
-        if (!fileName.includes(marker.sentinel)) {
-          continue;
-        }
-
-        hashes.set(
-          marker.sentinel,
-          contentHash(
-            `${groupSeed}\0${memberIndex}\0${marker.sentinel}`,
-            hashCharacters,
-          ).slice(0, marker.length),
-        );
-      }
-    });
-
-    for (const output of orderedGroup) {
-      finalFileNames.set(
-        output,
-        replaceHashMarkers(preliminaryFileNames.get(output)!, hashes, markers),
-      );
-    }
-
-    completedGroups.add(groupIndex);
-  }
-
-  for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
-    computeGroup(groupIndex);
-  }
+  assertUniqueFinalFileNames(outputValues, finalFileNames);
 
   const finalizedFileNameReplacements = new Map<string, string>();
 
   for (const output of outputValues) {
-    const before = preliminaryFileNames.get(output)!;
+    const before = requiredMapValue(
+      preliminaryFileNames,
+      output,
+      "preliminary output filename",
+    );
     const after = finalFileNames.get(output) ?? before;
 
     if (before !== after) {
-      addReplacement(finalizedFileNameReplacements, before, after);
+      addFileNameReplacement(finalizedFileNameReplacements, before, after);
     }
   }
 
-  for (const [, output] of outputs) {
-    if (output.type === "chunk") {
-      output.code = replaceFileNameReferences(output.code, finalizedFileNameReplacements);
-      output.imports = (output.imports ?? []).map((value) =>
-        replaceFileNameReferences(value, finalizedFileNameReplacements),
-      );
-      output.dynamicImports = (output.dynamicImports ?? []).map((value) =>
-        replaceFileNameReferences(value, finalizedFileNameReplacements),
-      );
-      const compatible = output as CompatibleOutputChunk;
-
-      if (compatible.implicitlyLoadedBefore !== undefined) {
-        compatible.implicitlyLoadedBefore = compatible.implicitlyLoadedBefore.map(
-          (value) =>
-            replaceFileNameReferences(value, finalizedFileNameReplacements),
-        );
-      }
-
-      if (compatible.referencedFiles !== undefined) {
-        compatible.referencedFiles = compatible.referencedFiles.map((value) =>
-          replaceFileNameReferences(value, finalizedFileNameReplacements),
-        );
-      }
-
-      if (output.sourcemapFileName !== null && output.sourcemapFileName !== undefined) {
-        output.sourcemapFileName = replaceFileNameReferences(
-          output.sourcemapFileName,
-          finalizedFileNameReplacements,
-        );
-      }
-    } else if (typeof output.source === "string") {
-      const source = output.source;
-      const updatedSource = replaceFileNameReferences(
-        source,
-        finalizedFileNameReplacements,
-      );
-
-      if (updatedSource !== source) {
-        output.source = updatedSource;
-      }
-    }
-  }
-
-  const canRekeyBundle = outputs.every(([, output]) => {
-    const descriptor = Object.getOwnPropertyDescriptor(
-      output,
-      output.type === "chunk" ? "code" : "source",
-    );
-
-    return descriptor?.get === undefined;
-  });
+  updateOutputFileNameReferences(outputValues, finalizedFileNameReplacements);
 
   for (const [, output] of outputs) {
     output.fileName = finalFileNames.get(output) ?? output.fileName;
   }
 
-  if (canRekeyBundle) {
-    for (const [bundleKey, output] of outputs) {
-      if (bundleKey === output.fileName) {
-        continue;
-      }
-
-      bundle[output.fileName] = output;
-      delete bundle[bundleKey];
-    }
-  }
+  rekeyOutputBundle(bundle, outputs);
 }
 
 function collisionMessage(className: string, original: string): string {
