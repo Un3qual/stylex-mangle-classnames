@@ -18,7 +18,7 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
-- Extracted builds must provide a bundled CSS asset; stylesheets created only during `writeBundle` are left unchanged.
+- Extracted builds must provide a bundled CSS asset; CSS-free extracted builds fail before StyleX creates its late fallback stylesheet.
 
 ## 0.1.1
 

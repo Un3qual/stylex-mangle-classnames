@@ -43,7 +43,7 @@ export default defineConfig({
 });
 ```
 
-Ensure the application emits a CSS asset, for example by importing an application stylesheet. Current `@stylexjs/unplugin` builds append extracted StyleX rules to that asset during `generateBundle`, where the mangler can rewrite them before output is written. Its fallback stylesheet, used when the build has no CSS asset, is written later and cannot be mangled without invalidating finalized output metadata.
+Ensure the application emits a CSS asset, for example by importing an application stylesheet. Current `@stylexjs/unplugin` builds append extracted StyleX rules to that asset during `generateBundle`, where the mangler can rewrite them before output is written. A CSS-free extracted build fails with an actionable error because StyleX writes its fallback stylesheet after output metadata is finalized.
 
 ### Runtime-injected CSS
 
@@ -82,7 +82,7 @@ Short names are build artifacts. Do not persist them or depend on a specific Sty
 - Vite 5 through Vite 8.
 - ESM projects.
 - Extracted and runtime-injected StyleX output.
-- Extracted builds must emit a CSS asset before `writeBundle`; the `@stylexjs/unplugin` fallback stylesheet used by CSS-free builds is not rewritten.
+- Extracted builds must emit a CSS asset before `writeBundle`; CSS-free extracted builds fail instead of emitting mismatched JavaScript and CSS.
 - Client and SSR builds that contain the same generated StyleX class set. Independently executed builds with different class sets may assign different short names because mappings are not shared across build processes.
 
 ## Development

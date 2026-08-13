@@ -1,3 +1,5 @@
+import postcss from "postcss";
+
 const SHORT_CLASS_NAME_ALPHABET = "abcdefghijklmnopqrstuvwxyz";
 const CSS_IDENTIFIER_CHARACTER = "A-Za-z0-9_-";
 
@@ -35,6 +37,59 @@ function atomicClassSelectorPattern(classNamePrefix: string): RegExp {
 const classSelectorPattern = /\.([_A-Za-z][_A-Za-z0-9-]*)/g;
 
 const stylexRulePattern = /\b(?:ltr|rtl)\s*:\s*(?:`([^`]*)`|"((?:\\.|[^"\\])*)")/g;
+
+function selectorClassText(selector: string): string {
+  let bracketDepth = 0;
+  let comment = false;
+  let escaped = false;
+  let quote: '"' | "'" | null = null;
+  let result = "";
+
+  for (let index = 0; index < selector.length; index += 1) {
+    const character = selector[index]!;
+    const nextCharacter = selector[index + 1];
+
+    if (comment) {
+      if (character === "*" && nextCharacter === "/") {
+        comment = false;
+        index += 1;
+      }
+
+      continue;
+    }
+
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = null;
+      }
+
+      continue;
+    }
+
+    if (character === "/" && nextCharacter === "*") {
+      comment = true;
+      result += " ";
+      index += 1;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+      result += " ";
+    } else if (character === "[") {
+      bracketDepth += 1;
+      result += " ";
+    } else if (character === "]" && bracketDepth > 0) {
+      bracketDepth -= 1;
+      result += " ";
+    } else if (bracketDepth === 0) {
+      result += character;
+    }
+  }
+
+  return result;
+}
 
 function isStylexConstKey(source: string, classNameOffset: number): boolean {
   const keyOffset = source.lastIndexOf("constKey", classNameOffset);
@@ -86,78 +141,29 @@ export function mangleStylexClassName(
   return mangled;
 }
 
-function findClassNamesInSelectorPreludes(source: string, pattern: RegExp): Set<string> {
+function findClassNamesInSelectors(source: string, pattern: RegExp): Set<string> {
   const classNames = new Set<string>();
-  let comment = false;
-  let escaped = false;
-  let prelude = "";
-  let quote: '"' | "'" | null = null;
 
-  function collectPrelude(): void {
-    const selector = prelude.trim();
-
-    if (selector !== "" && !selector.startsWith("@")) {
-      for (const match of selector.matchAll(pattern)) {
+  postcss.parse(source).walkRules((rule) => {
+    for (const selector of rule.selectors) {
+      for (const match of selectorClassText(selector).matchAll(pattern)) {
         classNames.add(match[1]!);
       }
     }
-
-    prelude = "";
-  }
-
-  for (let index = 0; index < source.length; index += 1) {
-    const character = source[index]!;
-    const nextCharacter = source[index + 1];
-
-    if (comment) {
-      if (character === "*" && nextCharacter === "/") {
-        comment = false;
-        index += 1;
-      }
-
-      continue;
-    }
-
-    if (quote !== null) {
-      if (escaped) {
-        escaped = false;
-      } else if (character === "\\") {
-        escaped = true;
-      } else if (character === quote) {
-        quote = null;
-      }
-
-      continue;
-    }
-
-    if (character === "/" && nextCharacter === "*") {
-      comment = true;
-      prelude += " ";
-      index += 1;
-    } else if (character === '"' || character === "'") {
-      quote = character;
-      prelude += " ";
-    } else if (character === "{") {
-      collectPrelude();
-    } else if (character === ";" || character === "}") {
-      prelude = "";
-    } else {
-      prelude += character;
-    }
-  }
+  });
 
   return classNames;
 }
 
 export function findCssClassNamesInSelectors(source: string): Set<string> {
-  return findClassNamesInSelectorPreludes(source, classSelectorPattern);
+  return findClassNamesInSelectors(source, classSelectorPattern);
 }
 
 export function findStylexClassNamesInSelectors(
   source: string,
   classNamePrefix: string,
 ): Set<string> {
-  return findClassNamesInSelectorPreludes(source, atomicClassSelectorPattern(classNamePrefix));
+  return findClassNamesInSelectors(source, atomicClassSelectorPattern(classNamePrefix));
 }
 
 export function findStylexClassNameReferences(

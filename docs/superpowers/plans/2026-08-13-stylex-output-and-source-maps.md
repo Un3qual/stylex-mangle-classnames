@@ -6,7 +6,7 @@
 
 **Architecture:** Discover generated classes from compiled StyleX style objects and runtime `ltr`/`rtl` rules during JavaScript transforms. Sort the complete set before rendering, rewrite JavaScript in `renderChunk`, and return a high-resolution edit map for Rollup to compose. Rewrite bundled CSS and HTML assets in `generateBundle`.
 
-**Tech Stack:** TypeScript, Vite/Rollup plugin hooks, MagicString, Vitest, pnpm.
+**Tech Stack:** TypeScript, Vite/Rollup plugin hooks, MagicString, PostCSS, Vitest, pnpm.
 
 ## Global Constraints
 

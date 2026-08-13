@@ -238,6 +238,28 @@ async function buildWithExtractedCss(): Promise<{
   };
 }
 
+async function buildExtractedWithoutCssAsset(): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+
+  await build({
+    build: {
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: { input: "virtual:entry" },
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      virtualExtractedEntry(),
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+    ],
+  });
+}
+
 async function buildWithPrefixClasses(): Promise<string> {
   const prefix = "a";
   const hashes = ["0", ..."123456789abcdefghijklmnopq".split("")];
@@ -464,5 +486,11 @@ describe("production output", () => {
 
     expect(originalPosition).toMatchObject({ column: 28, line: 2 });
     expect(originalPosition.source).toContain("virtual-entry.js");
+  });
+
+  test("rejects extracted output without a bundled CSS asset", async () => {
+    await expect(buildExtractedWithoutCssAsset()).rejects.toThrow(
+      "extracted StyleX output requires a bundled CSS asset",
+    );
   });
 });

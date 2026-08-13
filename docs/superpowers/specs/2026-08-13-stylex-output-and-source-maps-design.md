@@ -20,7 +20,7 @@ Extracted output is discovered from the generated class values in compiled Style
 
 Discovery runs across transformed JavaScript modules before rendering. The complete class set is sorted once, then JavaScript chunks are rewritten in `renderChunk` so content hashes incorporate the final code. CSS and HTML assets already present in the output bundle are rewritten in `generateBundle`.
 
-Extracted builds must provide a CSS asset for `@stylexjs/unplugin` to update during `generateBundle`. Its CSS-free fallback is written during `writeBundle`, after chunk hashes and related metadata are final, so that fallback is left unchanged.
+Extracted builds must provide a CSS asset for `@stylexjs/unplugin` to update during `generateBundle`. Its CSS-free fallback is written during `writeBundle`, after chunk hashes and related metadata are final, so the plugin fails those builds before output is written.
 
 ## Rewriting and Collisions
 

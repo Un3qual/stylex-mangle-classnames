@@ -65,6 +65,21 @@ function runGenerateBundle(plugin: Plugin, bundle: Rollup.OutputBundle): void {
     }
   }
 
+  const moduleParsed = plugin.moduleParsed;
+
+  if (moduleParsed) {
+    const handler = typeof moduleParsed === "function" ? moduleParsed : moduleParsed.handler;
+
+    for (const output of Object.values(bundle)) {
+      if (output.type === "chunk") {
+        handler.call(context, {
+          code: output.code,
+          id: output.fileName,
+        } as Rollup.ModuleInfo);
+      }
+    }
+  }
+
   const renderStart = plugin.renderStart;
 
   if (renderStart) {
@@ -163,6 +178,27 @@ async function runTransform(plugin: Plugin, code: string) {
   );
 }
 
+async function runTransformForModule(
+  plugin: Plugin,
+  code: string,
+  id: string,
+  moduleType?: "js" | "css",
+) {
+  const hook = plugin.transform;
+
+  if (!hook) {
+    throw new Error("Expected the plugin to define transform");
+  }
+
+  const handler = typeof hook === "function" ? hook : hook.handler;
+  return handler.call(
+    { parse: parseAst } as unknown as Rollup.TransformPluginContext,
+    code,
+    id,
+    (moduleType === undefined ? {} : { moduleType }) as never,
+  );
+}
+
 describe("stylexMangleClassNames", () => {
   test("maps generated classes to a through z, then aa and ab", () => {
     const originals = "123456789abcdefghijklmnopqrs"
@@ -232,13 +268,31 @@ describe("stylexMangleClassNames", () => {
     const source = [
       `/* .${PREFIX}commented */`,
       `.icon::before{content:".${PREFIX}value"}`,
+      `.root{--token:.${PREFIX}declaration{color:red};}`,
+      `[data-value=".${PREFIX}attribute"] .${PREFIX}descendant{color:red}`,
       `@supports selector(.${PREFIX}condition){.${PREFIX}nested:hover{color:red}}`,
     ].join("\n");
 
     expect(findStylexClassNamesInSelectors(source, PREFIX)).toEqual(
-      new Set([`${PREFIX}nested`]),
+      new Set([`${PREFIX}descendant`, `${PREFIX}nested`]),
     );
   });
+
+  test.each(["css", "less", "sass", "scss", "styl", "stylus", "pcss", "postcss", "sss"])(
+    "does not parse .%s stylesheets as JavaScript without moduleType metadata",
+    async (extension) => {
+      const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+      await runConfigResolved(plugin, "serve");
+
+      await expect(
+        runTransformForModule(
+          plugin,
+          `.${PREFIX}1 { color: red; }`,
+          `/styles.${extension}?direct`,
+        ),
+      ).resolves.toBeNull();
+    },
+  );
 
   test("does not parse runtime rule objects from CSS assets", () => {
     const css = outputAsset("styles.css", String.raw`:root{--ltr:"\a"}`);
@@ -267,6 +321,60 @@ describe("stylexMangleClassNames", () => {
 
     expect(javascript.code.split("\n").at(-1)).toBe('globalThis.className = "b a";');
     expect(css.source).toBe(".a{color:red}");
+  });
+
+  test("collects generated classes from moduleParsed for cached build modules", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const context = { parse: parseAst } as unknown as Rollup.PluginContext;
+    const buildStart = plugin.buildStart;
+    const moduleParsed = plugin.moduleParsed;
+    const renderStart = plugin.renderStart;
+    const renderChunk = plugin.renderChunk;
+
+    if (!buildStart || !moduleParsed || !renderStart || !renderChunk) {
+      throw new Error("Expected build discovery and rendering hooks");
+    }
+
+    const buildStartHandler = typeof buildStart === "function" ? buildStart : buildStart.handler;
+    const moduleParsedHandler =
+      typeof moduleParsed === "function" ? moduleParsed : moduleParsed.handler;
+    const sources = [
+      `inject({ ltr: ".${PREFIX}z{color:blue}" });`,
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    ];
+
+    const renderStartHandler =
+      typeof renderStart === "function" ? renderStart : renderStart.handler;
+    const renderChunkHandler =
+      typeof renderChunk === "function" ? renderChunk : renderChunk.handler;
+
+    for (let buildNumber = 0; buildNumber < 2; buildNumber += 1) {
+      buildStartHandler.call(context, {} as Rollup.NormalizedInputOptions);
+
+      for (const [index, code] of sources.entries()) {
+        moduleParsedHandler.call(context, {
+          code,
+          id: `/cached-${index}.js`,
+        } as Rollup.ModuleInfo);
+      }
+
+      renderStartHandler.call(
+        context,
+        {} as Rollup.NormalizedOutputOptions,
+        {} as Rollup.NormalizedInputOptions,
+      );
+
+      const chunk = outputChunk(`globalThis.className = "${PREFIX}z ${PREFIX}1";`);
+      const result = renderChunkHandler.call(
+        context,
+        chunk.code,
+        chunk,
+        {} as Rollup.NormalizedOutputOptions,
+        {} as never,
+      ) as { code: string } | null;
+
+      expect(result?.code).toBe('globalThis.className = "b a";');
+    }
   });
 
   test("preserves StyleX constants, custom properties, keyframes, and unrelated classes", () => {

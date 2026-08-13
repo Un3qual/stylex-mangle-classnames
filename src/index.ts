@@ -56,7 +56,7 @@ function isJavaScriptModule(id: string, moduleType: string | undefined): boolean
     return moduleType === "js";
   }
 
-  return !/\.(?:css|html)(?:$|\?)/.test(id);
+  return !/\.(?:css|less|sass|scss|styl|stylus|pcss|postcss|sss|html)(?:$|\?)/.test(id);
 }
 
 /**
@@ -71,7 +71,8 @@ export default function stylexMangleClassNames(
 
   const classNames = new Map<string, string>();
   const generatedNames = new Map<string, string>();
-  const pendingBuildClassNames = new Set<string>();
+  const pendingCompiledClassNames = new Set<string>();
+  const pendingRuntimeClassNames = new Set<string>();
   let command: ResolvedConfig["command"] = "build";
 
   function rememberClassName(original: string): void {
@@ -91,11 +92,11 @@ export default function stylexMangleClassNames(
   function findGeneratedClassNames(
     context: Pick<Rollup.PluginContext, "parse">,
     source: string,
-  ): Set<string> {
-    return new Set([
-      ...findStylexClassNamesInCompiledObjects(context.parse(source), classNamePrefix),
-      ...findStylexClassNamesInRules(source, classNamePrefix),
-    ]);
+  ): { compiled: Set<string>; runtime: Set<string> } {
+    return {
+      compiled: findStylexClassNamesInCompiledObjects(context.parse(source), classNamePrefix),
+      runtime: findStylexClassNamesInRules(source, classNamePrefix),
+    };
   }
 
   function assertNoAuthoredCssCollisions(
@@ -123,7 +124,8 @@ export default function stylexMangleClassNames(
     buildStart() {
       classNames.clear();
       generatedNames.clear();
-      pendingBuildClassNames.clear();
+      pendingCompiledClassNames.clear();
+      pendingRuntimeClassNames.clear();
     },
     configResolved(config) {
       command = config.command;
@@ -133,22 +135,39 @@ export default function stylexMangleClassNames(
         return null;
       }
 
-      const originals = findGeneratedClassNames(this, code);
-
       if (command === "build") {
-        for (const original of originals) {
-          pendingBuildClassNames.add(original);
-        }
-
         return null;
       }
 
+      const discovered = findGeneratedClassNames(this, code);
+      const originals = new Set([...discovered.compiled, ...discovered.runtime]);
       registerClassNames(originals);
       const result = rewriteStylexClassNames(code, classNamePrefix, classNames);
       return result.changed ? { code: result.code, map: null } : null;
     },
+    moduleParsed(moduleInfo) {
+      if (
+        command !== "build" ||
+        moduleInfo.code === null ||
+        !isJavaScriptModule(moduleInfo.id, undefined)
+      ) {
+        return;
+      }
+
+      const discovered = findGeneratedClassNames(this, moduleInfo.code);
+
+      for (const original of discovered.compiled) {
+        pendingCompiledClassNames.add(original);
+      }
+
+      for (const original of discovered.runtime) {
+        pendingRuntimeClassNames.add(original);
+      }
+    },
     renderStart() {
-      registerClassNames(pendingBuildClassNames);
+      registerClassNames(
+        new Set([...pendingCompiledClassNames, ...pendingRuntimeClassNames]),
+      );
     },
     renderChunk(code, chunk) {
       const result = rewriteStylexClassNames(code, classNamePrefix, classNames);
@@ -162,6 +181,16 @@ export default function stylexMangleClassNames(
       handler(_outputOptions, bundle) {
         const assets = textAssets(bundle);
         const cssSources = assets.filter(isCssAsset).map(({ source }) => source);
+        const hasExtractedClasses = [...pendingCompiledClassNames].some(
+          (className) => !pendingRuntimeClassNames.has(className),
+        );
+
+        if (hasExtractedClasses && cssSources.length === 0) {
+          this.error(
+            "stylex-mangle-classnames: extracted StyleX output requires a bundled CSS asset; import a stylesheet so StyleX can emit CSS before writeBundle",
+          );
+        }
+
         assertNoAuthoredCssCollisions(this, cssSources);
 
         for (const { output, source } of assets) {

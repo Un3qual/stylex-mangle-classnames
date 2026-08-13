@@ -11,6 +11,9 @@ importers:
       magic-string:
         specifier: ^1.1.1
         version: 1.1.1
+      postcss:
+        specifier: ^8.5.26
+        version: 8.5.26
     devDependencies:
       '@changesets/cli':
         specifier: ^3.0.0
