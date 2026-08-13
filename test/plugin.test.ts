@@ -162,7 +162,7 @@ async function runConfigResolved(
   await handler.call({} as never, { build: { sourcemap }, command } as ResolvedConfig);
 }
 
-async function runTransform(plugin: Plugin, code: string) {
+function runTransform(plugin: Plugin, code: string) {
   const hook = plugin.transform;
 
   if (!hook) {
@@ -170,11 +170,13 @@ async function runTransform(plugin: Plugin, code: string) {
   }
 
   const handler = typeof hook === "function" ? hook : hook.handler;
-  return handler.call(
-    { parse: parseAst } as unknown as Rollup.TransformPluginContext,
-    code,
-    "/virtual-entry.js",
-    { moduleType: "js" },
+  return Promise.resolve(
+    handler.call(
+      { parse: parseAst } as unknown as Rollup.TransformPluginContext,
+      code,
+      "/virtual-entry.js",
+      { moduleType: "js" },
+    ),
   );
 }
 
