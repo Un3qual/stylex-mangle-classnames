@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { posix } from "node:path";
 import type { Plugin, ResolvedConfig, Rollup } from "vite";
 import {
   findCssClassNamesInSelectors,
@@ -6,8 +7,9 @@ import {
   findStylexClassNamesInRules,
   mangleStylexClassName,
   rewriteStylexClassNames,
+  type StylexClassNameEdit,
 } from "./class-names.js";
-import { rewriteWithSourceMap } from "./source-maps.js";
+import { composeWithSourceMap, rewriteWithSourceMap } from "./source-maps.js";
 
 export type StylexMangleClassNamesOptions = {
   /** Must exactly match the classNamePrefix passed to the StyleX compiler. */
@@ -25,6 +27,20 @@ type DiscoveredClassNames = {
 };
 
 type HashCharacters = NonNullable<Rollup.OutputOptions["hashCharacters"]>;
+
+type CssHashMarker = {
+  length: number;
+  token: string;
+};
+
+type CompatiblePreRenderedAsset = Rollup.PreRenderedAsset & {
+  name?: string;
+  names?: readonly string[];
+  originalFileName?: string;
+  originalFileNames?: readonly string[];
+};
+
+const sourceMapDirectivePattern = /\/\*[#@]\s*sourceMappingURL=([^\s*]+)\s*\*\/\s*$/;
 
 function assetSourceToString(source: string | Uint8Array): string {
   return typeof source === "string" ? source : new TextDecoder().decode(source);
@@ -51,9 +67,17 @@ function isCssPreRenderedAsset(
   asset: Rollup.PreRenderedAsset,
   pattern: string,
 ): boolean {
+  const compatible = asset as CompatiblePreRenderedAsset;
+  const names = [
+    ...(compatible.names ?? []),
+    ...(compatible.originalFileNames ?? []),
+    compatible.name,
+    compatible.originalFileName,
+  ].filter((name): name is string => name !== undefined);
+
   return (
     pattern.endsWith(".css") ||
-    [...asset.names, ...asset.originalFileNames].some((name) => name.endsWith(".css"))
+    names.some((name) => name.endsWith(".css"))
   );
 }
 
@@ -71,17 +95,155 @@ function contentHash(source: string, hashCharacters: HashCharacters): string {
   return digest.toString("base64url");
 }
 
-function replaceHashPlaceholders(
+function markHashPlaceholders(
   pattern: string,
-  source: string,
-  hashCharacters: HashCharacters,
+  markerId: number,
+  markers: Map<string, CssHashMarker>,
 ): string {
-  const hash = contentHash(source, hashCharacters);
-
   return pattern.replace(/\[hash(?::(\d+))?\]/g, (_placeholder, size: string | undefined) => {
     const length = size === undefined ? 8 : Number.parseInt(size, 10);
-    return hash.slice(0, length);
+    const core = `_S${markerId.toString(36).toUpperCase()}_`;
+
+    if (core.length > length) {
+      throw new Error(
+        `stylex-mangle-classnames: CSS hash length ${length} is too short for final-content hashing`,
+      );
+    }
+
+    const token = core.padEnd(length, "_");
+    markers.set(token, { length, token });
+    return token;
   });
+}
+
+function replaceHashMarkers(value: string, hashes: ReadonlyMap<string, string>): string {
+  let result = value;
+
+  for (const [marker, hash] of hashes) {
+    result = result.replaceAll(marker, hash);
+  }
+
+  return result;
+}
+
+function sourceMapAsset(
+  bundle: Rollup.OutputBundle,
+  cssFileName: string,
+  sourceMapUrl?: string,
+): Rollup.OutputAsset | null {
+  const fileName =
+    sourceMapUrl === undefined
+      ? `${cssFileName}.map`
+      : posix.normalize(
+          posix.join(posix.dirname(cssFileName), decodeURIComponent(sourceMapUrl)),
+        );
+  const output = bundle[fileName];
+
+  return output?.type === "asset" ? output : null;
+}
+
+function rewriteCssWithSourceMap(
+  bundle: Rollup.OutputBundle,
+  asset: Rollup.OutputAsset,
+  source: string,
+  edits: readonly StylexClassNameEdit[],
+): string {
+  const rewrite = rewriteWithSourceMap(source, asset.fileName, edits);
+  const directive = source.match(sourceMapDirectivePattern);
+  const sourceMapUrl = directive?.[1];
+
+  if (sourceMapUrl?.startsWith("data:application/json") === true) {
+    const inline = /^data:application\/json(?:;charset=[^;,]+)?(;base64)?,(.*)$/.exec(
+      sourceMapUrl,
+    );
+
+    if (inline === null) {
+      return rewrite.code;
+    }
+
+    const inlineData = inline[2];
+
+    if (inlineData === undefined) {
+      return rewrite.code;
+    }
+
+    const inputMap = inline[1]
+      ? Buffer.from(inlineData, "base64").toString("utf8")
+      : decodeURIComponent(inlineData);
+    const composed = composeWithSourceMap(rewrite, inputMap);
+    const encoded = inline[1]
+      ? Buffer.from(composed).toString("base64")
+      : encodeURIComponent(composed);
+    const updatedUrl = `data:application/json${inline[1] ? ";base64" : ""},${encoded}`;
+
+    return rewrite.code.replace(sourceMapUrl, updatedUrl);
+  }
+
+  const mapAsset = sourceMapAsset(bundle, asset.fileName, sourceMapUrl);
+
+  if (mapAsset !== null) {
+    mapAsset.source = composeWithSourceMap(
+      rewrite,
+      assetSourceToString(mapAsset.source),
+    );
+  }
+
+  return rewrite.code;
+}
+
+function finalizeCssHashMarkers(
+  bundle: Rollup.OutputBundle,
+  cssAssets: readonly TextAsset[],
+  hashCharacters: HashCharacters,
+  markers: ReadonlyMap<string, CssHashMarker>,
+): void {
+  const hashes = new Map<string, string>();
+
+  for (const { output } of cssAssets) {
+    const source = assetSourceToString(output.source);
+    let normalizedSource = source;
+
+    for (const { length, token } of markers.values()) {
+      normalizedSource = normalizedSource.replaceAll(token, "0".repeat(length));
+    }
+
+    const hash = contentHash(normalizedSource, hashCharacters);
+
+    for (const { length, token } of markers.values()) {
+      if (output.fileName.includes(token)) {
+        hashes.set(token, hash.slice(0, length));
+      }
+    }
+  }
+
+  if (hashes.size === 0) {
+    return;
+  }
+
+  const outputs = Object.entries(bundle);
+
+  for (const [, output] of outputs) {
+    if (output.type === "chunk") {
+      output.code = replaceHashMarkers(output.code, hashes);
+    } else {
+      const source = assetSourceToString(output.source);
+      const updatedSource = replaceHashMarkers(source, hashes);
+
+      if (updatedSource !== source) {
+        output.source = updatedSource;
+      }
+    }
+  }
+
+  for (const [, output] of outputs) {
+    const updatedFileName = replaceHashMarkers(output.fileName, hashes);
+
+    if (updatedFileName === output.fileName) {
+      continue;
+    }
+
+    output.fileName = updatedFileName;
+  }
 }
 
 function collisionMessage(className: string, original: string): string {
@@ -121,6 +283,9 @@ export default function stylexMangleClassNames(
   const discoveredClassNamesByModule = new Map<string, DiscoveredClassNames>();
   let command: ResolvedConfig["command"] = "build";
   let buildEmitsAssets = true;
+  let assetHashMarkerIds = new WeakMap<object, number>();
+  const cssHashMarkers = new Map<string, CssHashMarker>();
+  let nextAssetHashMarkerId = 0;
 
   function rememberClassName(original: string): void {
     const mangled = mangleStylexClassName(original, classNamePrefix, classNames);
@@ -174,6 +339,11 @@ export default function stylexMangleClassNames(
       pendingCompiledClassNames.clear();
       pendingRuntimeClassNames.clear();
     },
+    closeBundle() {
+      assetHashMarkerIds = new WeakMap<object, number>();
+      cssHashMarkers.clear();
+      nextAssetHashMarkerId = 0;
+    },
     configResolved(config) {
       command = config.command;
       buildEmitsAssets =
@@ -182,8 +352,6 @@ export default function stylexMangleClassNames(
     outputOptions(outputOptions) {
       const assetFileNames =
         outputOptions.assetFileNames ?? "assets/[name]-[hash][extname]";
-      const hashCharacters = outputOptions.hashCharacters ?? "base64";
-
       return {
         ...outputOptions,
         assetFileNames(asset) {
@@ -196,12 +364,15 @@ export default function stylexMangleClassNames(
             return pattern;
           }
 
-          const source = assetSourceToString(asset.source);
-          const result = rewriteStylexClassNames(source, classNamePrefix, classNames);
+          let markerId = assetHashMarkerIds.get(asset);
 
-          return result.changed
-            ? replaceHashPlaceholders(pattern, result.code, hashCharacters)
-            : pattern;
+          if (markerId === undefined) {
+            markerId = nextAssetHashMarkerId;
+            nextAssetHashMarkerId += 1;
+            assetHashMarkerIds.set(asset, markerId);
+          }
+
+          return markHashPlaceholders(pattern, markerId, cssHashMarkers);
         },
       };
     },
@@ -214,8 +385,7 @@ export default function stylexMangleClassNames(
         return null;
       }
 
-      const discovered = findGeneratedClassNames(this, code);
-      registerClassNames(discovered.runtime);
+      registerClassNames(findStylexClassNamesInRules(code, classNamePrefix));
       const result = rewriteStylexClassNames(code, classNamePrefix, classNames);
       return result.changed ? { code: result.code, map: null } : null;
     },
@@ -268,7 +438,7 @@ export default function stylexMangleClassNames(
     },
     generateBundle: {
       order: "post",
-      handler(_outputOptions, bundle) {
+      handler(outputOptions, bundle) {
         const assets = textAssets(bundle);
         const cssSources = assets.filter(isCssAsset).map(({ source }) => source);
         const hasExtractedClasses = [...pendingCompiledClassNames].some(
@@ -287,9 +457,18 @@ export default function stylexMangleClassNames(
           const result = rewriteStylexClassNames(source, classNamePrefix, classNames);
 
           if (result.changed) {
-            output.source = result.code;
+            output.source = isCssAsset({ output, source })
+              ? rewriteCssWithSourceMap(bundle, output, source, result.edits)
+              : result.code;
           }
         }
+
+        finalizeCssHashMarkers(
+          bundle,
+          assets.filter(isCssAsset),
+          outputOptions.hashCharacters ?? "base64",
+          cssHashMarkers,
+        );
       },
     },
   };

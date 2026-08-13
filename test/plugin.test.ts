@@ -208,6 +208,33 @@ function runTransformForModule(
 }
 
 describe("stylexMangleClassNames", () => {
+  test("accepts Rollup 4.2 singular asset metadata", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const hook = plugin.outputOptions;
+
+    if (!hook) {
+      throw new Error("Expected the plugin to define outputOptions");
+    }
+
+    const handler = typeof hook === "function" ? hook : hook.handler;
+    const result = handler.call({} as Rollup.PluginContext, {
+      assetFileNames: "assets/[name]-[hash][extname]",
+    } as Rollup.OutputOptions);
+
+    if (result instanceof Promise || !result || typeof result.assetFileNames !== "function") {
+      throw new Error("Expected a synchronous asset filename callback");
+    }
+
+    const fileName = result.assetFileNames({
+      name: "stylex.css",
+      source: `.${PREFIX}1{color:red}`,
+      type: "asset",
+    } as Rollup.PreRenderedAsset);
+
+    expect(fileName).toMatch(/^assets\/\[name\]-.{8}\[extname\]$/);
+    expect(fileName).not.toContain("[hash]");
+  });
+
   test("maps generated classes to a through z, then aa and ab", () => {
     const originals = "123456789abcdefghijklmnopqrs"
       .split("")
@@ -502,6 +529,37 @@ describe("stylexMangleClassNames", () => {
     ].join("\n");
 
     await expect(runTransform(plugin, source)).resolves.toEqual({
+      code: ['inject({ ltr: ".a{color:red}" });', 'globalThis.className = "a";'].join("\n"),
+      map: null,
+    });
+  });
+
+  test("does not parse compiled objects during Vite development transforms", async () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    await runConfigResolved(plugin, "serve");
+    const hook = plugin.transform;
+
+    if (!hook) {
+      throw new Error("Expected the plugin to define transform");
+    }
+
+    const handler = typeof hook === "function" ? hook : hook.handler;
+    const source = [
+      `inject({ ltr: ".${PREFIX}1{color:red}" });`,
+      `globalThis.className = "${PREFIX}1";`,
+    ].join("\n");
+    const result = await handler.call(
+      {
+        parse(): never {
+          throw new Error("development transforms must not parse compiled objects");
+        },
+      } as unknown as Rollup.TransformPluginContext,
+      source,
+      "/virtual-entry.js",
+      { moduleType: "js" },
+    );
+
+    expect(result).toEqual({
       code: ['inject({ ltr: ".a{color:red}" });', 'globalThis.className = "a";'].join("\n"),
       map: null,
     });

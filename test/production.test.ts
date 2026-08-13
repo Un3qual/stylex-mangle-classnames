@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SourceMapConsumer, type RawSourceMap } from "source-map-js";
+import { SourceMapConsumer, SourceMapGenerator, type RawSourceMap } from "source-map-js";
 import { afterEach, describe, expect, test } from "vitest";
 import { build, type Plugin, type Rollup } from "vite";
 import stylexMangleClassNames from "../src/index.js";
@@ -86,6 +86,30 @@ function bundledCss(source: string, name = "stylex.css"): Plugin {
     name: "bundled-stylex-css",
     generateBundle() {
       this.emitFile({ name, source, type: "asset" });
+    },
+  };
+}
+
+function bundledCssWithLateAppend(source: string): Plugin {
+  let referenceId: string;
+
+  return {
+    name: "bundled-stylex-css-with-late-append",
+    buildStart() {
+      referenceId = this.emitFile({
+        name: "stylex.css",
+        source: ".base{display:block}",
+        type: "asset",
+      });
+    },
+    generateBundle(_outputOptions, bundle) {
+      const output = bundle[this.getFileName(referenceId)];
+
+      if (output?.type !== "asset") {
+        throw new Error("Expected the emitted CSS asset in generateBundle");
+      }
+
+      output.source = `${output.source}${source}`;
     },
   };
 }
@@ -238,6 +262,80 @@ async function buildWithExtractedCss(): Promise<{
   };
 }
 
+async function buildWithExtractedCssSourceMap(): Promise<{
+  css: string;
+  sourceMap: Record<string, unknown>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+  const css = [
+    ".lead{color:black}",
+    `.${PREFIX}1{color:red}`,
+    ".tail{color:blue}",
+  ].join("");
+  const map = new SourceMapGenerator({ file: "stylex.css" });
+  const stylexOffset = css.indexOf(`.${PREFIX}1`);
+  const tailOffset = css.indexOf(".tail");
+
+  for (const column of [0, stylexOffset, tailOffset]) {
+    map.addMapping({
+      generated: { column, line: 1 },
+      original: { column, line: 1 },
+      source: "style.css",
+    });
+  }
+
+  map.setSourceContent("style.css", css);
+
+  await build({
+    build: {
+      cssMinify: false,
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: { input: "virtual:entry" },
+      sourcemap: true,
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      virtualExtractedEntry(),
+      {
+        name: "bundled-css-source-map",
+        generateBundle() {
+          this.emitFile({
+            name: "stylex.css",
+            source: `${css}\n/*# sourceMappingURL=stylex.css.map */`,
+            type: "asset",
+          });
+          this.emitFile({
+            fileName: "assets/stylex.css.map",
+            source: map.toString(),
+            type: "asset",
+          });
+        },
+      },
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+    ],
+  });
+
+  const assetsDirectory = join(outDir, "assets");
+  const files = await readdir(assetsDirectory);
+  const cssFile = files.find((file) => file.endsWith(".css"));
+  const mapFile = files.find((file) => file.endsWith(".css.map"));
+
+  if (!cssFile || !mapFile) {
+    throw new Error("Expected Vite to emit CSS and its source map");
+  }
+
+  return {
+    css: await readFile(join(assetsDirectory, cssFile), "utf8"),
+    sourceMap: JSON.parse(await readFile(join(assetsDirectory, mapFile), "utf8")),
+  };
+}
+
 async function buildExtractedWithoutCssAsset(ssr = false): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
   const outDir = join(root, "dist");
@@ -317,6 +415,44 @@ async function buildHashedCss(
 
   if (!fileName) {
     throw new Error("Expected Vite to emit a hashed CSS asset");
+  }
+
+  return {
+    contents: await readFile(join(assetsDirectory, fileName), "utf8"),
+    fileName,
+  };
+}
+
+async function buildLateAppendedCss(rule: string): Promise<{
+  contents: string;
+  fileName: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+
+  await build({
+    build: {
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: { input: "virtual:entry" },
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      virtualExtractedEntry(),
+      bundledCssWithLateAppend(rule),
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+    ],
+  });
+
+  const assetsDirectory = join(outDir, "assets");
+  const fileName = (await readdir(assetsDirectory)).find((file) => file.endsWith(".css"));
+
+  if (!fileName) {
+    throw new Error("Expected Vite to emit a CSS asset");
   }
 
   return {
@@ -479,6 +615,15 @@ describe("production output", () => {
     expect(withExtra.fileName).not.toBe(withoutExtra.fileName);
   });
 
+  test("hashes CSS after extracted StyleX rules are appended", async () => {
+    const red = await buildLateAppendedCss(`.${PREFIX}1{color:red}`);
+    const blue = await buildLateAppendedCss(`.${PREFIX}1{color:blue}`);
+
+    expect(red.contents).toBe(".base{display:block}.a{color:red}");
+    expect(blue.contents).toBe(".base{display:block}.a{color:blue}");
+    expect(blue.fileName).not.toBe(red.fileName);
+  });
+
   test("hashes CSS identified by a function-based asset filename pattern", async () => {
     const output: Rollup.OutputOptions = {
       assetFileNames: () => "assets/[name]-[hash].css",
@@ -598,6 +743,22 @@ describe("production output", () => {
 
     expect(originalPosition).toMatchObject({ column: 28, line: 2 });
     expect(originalPosition.source).toContain("virtual-entry.js");
+  });
+
+  test("updates extracted CSS source maps after shortening selectors", async () => {
+    const output = await buildWithExtractedCssSourceMap();
+    const generatedIndex = output.css.indexOf(".tail");
+    const generatedPrefix = output.css.slice(0, generatedIndex).split("\n");
+    const originalPosition = new SourceMapConsumer(
+      output.sourceMap as unknown as RawSourceMap,
+    ).originalPositionFor({
+      column: lastLineLength(generatedPrefix),
+      line: generatedPrefix.length,
+    });
+
+    expect(output.css).toContain(".a{color:red}");
+    expect(originalPosition).toMatchObject({ column: 33, line: 1 });
+    expect(originalPosition.source).toContain("style.css");
   });
 
   test("rejects extracted output without a bundled CSS asset", async () => {

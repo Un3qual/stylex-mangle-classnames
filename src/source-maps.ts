@@ -1,3 +1,5 @@
+import * as remapping from "@ampproject/remapping";
+import type { RawSourceMap } from "@ampproject/remapping";
 import MagicString from "magic-string";
 import type { Rollup } from "vite";
 import type { StylexClassNameEdit } from "./class-names.js";
@@ -27,4 +29,19 @@ export function rewriteWithSourceMap(
       source: fileName,
     }) as Rollup.SourceMap,
   };
+}
+
+export function composeWithSourceMap(
+  rewrite: SourceMappedRewrite,
+  inputMap: string,
+): string {
+  const compose = remapping.default as unknown as (
+    maps: RawSourceMap[],
+    loader: () => null,
+  ) => { toString(): string };
+
+  return compose(
+    [rewrite.map as RawSourceMap, JSON.parse(inputMap) as RawSourceMap],
+    () => null,
+  ).toString();
 }
