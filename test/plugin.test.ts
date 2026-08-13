@@ -1018,6 +1018,77 @@ describe("stylexMangleClassNames", () => {
     }
   });
 
+  test("discovers a complete render chunk graph only once per render", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    let parseCount = 0;
+    const context = {
+      parse(source: string) {
+        parseCount += 1;
+        return parseAst(source);
+      },
+    } as unknown as Rollup.PluginContext;
+    const buildStart = plugin.buildStart;
+    const renderStart = plugin.renderStart;
+    const renderChunk = plugin.renderChunk;
+
+    if (!buildStart || !renderStart || !renderChunk) {
+      throw new Error("Expected build and rendering hooks");
+    }
+
+    const buildStartHandler = typeof buildStart === "function" ? buildStart : buildStart.handler;
+    const renderStartHandler =
+      typeof renderStart === "function" ? renderStart : renderStart.handler;
+    const renderChunkHandler =
+      typeof renderChunk === "function" ? renderChunk : renderChunk.handler;
+    const firstSource = `globalThis.style = { color: "${PREFIX}1", $$css: true };`;
+    const secondSource = `inject({ ltr: ".${PREFIX}z{color:blue}" });`;
+    const first = outputChunk(`globalThis.first = "${PREFIX}1";`);
+    first.fileName = "first.js";
+    first.modules = {
+      "/first.js": {
+        code: firstSource,
+        renderedExports: [],
+        renderedLength: firstSource.length,
+      },
+    };
+    const second = outputChunk(`globalThis.second = "${PREFIX}z";`);
+    second.fileName = "second.js";
+    second.modules = {
+      "/second.js": {
+        code: secondSource,
+        renderedExports: [],
+        renderedLength: secondSource.length,
+      },
+    };
+    const meta = { chunks: { [first.fileName]: first, [second.fileName]: second } };
+
+    buildStartHandler.call(context, {} as Rollup.NormalizedInputOptions);
+    renderStartHandler.call(
+      context,
+      {} as Rollup.NormalizedOutputOptions,
+      {} as Rollup.NormalizedInputOptions,
+    );
+
+    const firstResult = renderChunkHandler.call(
+      context,
+      first.code,
+      first,
+      {} as Rollup.NormalizedOutputOptions,
+      meta as never,
+    ) as { code: string } | null;
+    const secondResult = renderChunkHandler.call(
+      context,
+      second.code,
+      second,
+      {} as Rollup.NormalizedOutputOptions,
+      meta as never,
+    ) as { code: string } | null;
+
+    expect(firstResult?.code).toBe('globalThis.first = "a";');
+    expect(secondResult?.code).toBe('globalThis.second = "b";');
+    expect(parseCount).toBe(2);
+  });
+
   test("preserves StyleX constants, custom properties, keyframes, and unrelated classes", () => {
     const atomic = `${PREFIX}1dmbf1k`;
     const spacedConstKey = `register({ constKey${" ".repeat(40)}:${" ".repeat(40)}"${atomic}" });`;

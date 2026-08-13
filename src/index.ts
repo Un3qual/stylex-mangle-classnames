@@ -1100,33 +1100,36 @@ export default function stylexMangleClassNames(
         return null;
       }
 
-      hasCompleteRenderChunkGraph = true;
-      const renderedChunks = Object.values(meta.chunks);
-      const renderedSources = new Set<string>();
+      if (!hasCompleteRenderChunkGraph) {
+        hasCompleteRenderChunkGraph = true;
+        const renderedChunks = Object.values(meta.chunks);
+        const renderedSources = new Set<string>();
 
-      for (const renderedChunk of renderedChunks) {
-        for (const renderedModule of Object.values(renderedChunk.modules)) {
-          if (renderedModule.code !== null) {
-            renderedSources.add(renderedModule.code);
+        for (const renderedChunk of renderedChunks) {
+          for (const renderedModule of Object.values(renderedChunk.modules)) {
+            if (renderedModule.code !== null) {
+              renderedSources.add(renderedModule.code);
+            }
           }
         }
-      }
 
-      for (const source of renderedSources) {
-        const discovered = findGeneratedClassNames(this, source);
+        for (const source of renderedSources) {
+          const discovered = findGeneratedClassNames(this, source);
 
-        for (const original of discovered.compiled) {
-          pendingCompiledClassNames.add(original);
+          for (const original of discovered.compiled) {
+            pendingCompiledClassNames.add(original);
+          }
+
+          for (const original of discovered.runtime) {
+            pendingRuntimeClassNames.add(original);
+          }
         }
 
-        for (const original of discovered.runtime) {
-          pendingRuntimeClassNames.add(original);
-        }
+        registerClassNames(
+          new Set([...pendingCompiledClassNames, ...pendingRuntimeClassNames]),
+        );
       }
 
-      registerClassNames(
-        new Set([...pendingCompiledClassNames, ...pendingRuntimeClassNames]),
-      );
       const result = rewriteStylexClassNames(code, classNamePrefix, classNames);
 
       return result.changed
@@ -1134,6 +1137,8 @@ export default function stylexMangleClassNames(
         : null;
     },
     generateBundle: {
+      // Filename finalization must run after hooks that call getFileName. Rollup does
+      // not expose a way to update its file-reference registry after an output rename.
       order: "post",
       handler(outputOptions, bundle) {
         if (!hasCompleteRenderChunkGraph) {

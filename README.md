@@ -20,7 +20,7 @@ pnpm add --save-dev @un3qual/stylex-mangle-classnames
 
 ## Configure
 
-Place the mangler after the plugin that compiles StyleX. Use the same `classNamePrefix` in both plugins.
+Place the mangler after the plugin that compiles StyleX and after any other plugin with a post-ordered `generateBundle` hook that reads emitted filenames. Use the same `classNamePrefix` in both plugins.
 
 ### Extracted CSS
 
@@ -82,6 +82,7 @@ Short names are build artifacts. Do not persist them or depend on a specific Sty
 - Vite 5 through Vite 8.
 - ESM projects.
 - Extracted and runtime-injected StyleX output.
+- The mangler must run after other `generateBundle` hooks that call Rollup's `getFileName`; Rollup does not provide an API for synchronizing file-reference IDs after an output filename changes.
 - Extracted builds must emit a CSS asset before `writeBundle`; CSS-free extracted builds fail instead of emitting mismatched JavaScript and CSS.
 - Client and SSR builds that contain the same generated StyleX class set. Independently executed builds with different class sets may assign different short names because mappings are not shared across build processes.
 
