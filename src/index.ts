@@ -44,7 +44,8 @@ type CompatibleOutputChunk = Rollup.OutputChunk & {
 
 type OutputFile = Rollup.OutputChunk | Rollup.OutputAsset;
 
-const sourceMapDirectivePattern = /\/\*[#@]\s*sourceMappingURL=([^\s*]+)\s*\*\/\s*$/;
+const sourceMapDirectivePattern =
+  /\/\*[#@]\s*sourceMappingURL=((?:(?!\*\/)\S)+)\s*\*\/\s*$/;
 const javascriptSourceMapDirectivePattern =
   /\/\/[#@]\s*sourceMappingURL=([^\s]+)\s*$/;
 const hashMarkerSentinelPattern = /__STYLEX_HASH_[0-9a-z]+_[0-9a-z]+__/g;
@@ -185,7 +186,9 @@ function replaceFileNameReference(
     const prefix = path.slice(0, -before.length);
 
     if (
-      /^(?:(?:\.\.?\/)+|\/[^\s]*\/|(?:https?:)?\/\/[^\s]+\/)$/i.test(prefix)
+      /^(?:(?:\.\.?\/)+|\/(?:[^\s]*\/)?|(?:https?:)?\/\/[^\s]+\/)$/i.test(
+        prefix,
+      )
     ) {
       return `${prefix}${after}${suffix}`;
     }
@@ -219,7 +222,7 @@ function fileNameReferenceTokens(
   includeHtmlAttributes = false,
 ): string[] {
   const tokens: string[] = [];
-  const quotedPattern = /(["'`])([^"'`\r\n]*)\1/g;
+  const quotedPattern = /(["'`])((?:\\[\s\S]|(?!\1)[^\\\r\n])*)\1/g;
 
   for (const match of value.matchAll(quotedPattern)) {
     const token = match[2];
@@ -266,7 +269,7 @@ function replaceStructuredFileNameReferences(
   includeHtmlAttributes = false,
 ): string {
   const replaceQuoted = value.replace(
-    /(["'`])([^"'`\r\n]*)\1/g,
+    /(["'`])((?:\\[\s\S]|(?!\1)[^\\\r\n])*)\1/g,
     (match, quote: string, token: string) => {
       const replacement = replaceFileNameReference(token, replacements);
       return replacement === token ? match : `${quote}${replacement}${quote}`;

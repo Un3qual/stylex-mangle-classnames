@@ -548,6 +548,78 @@ describe("stylexMangleClassNames", () => {
     expect(html.source).toBe(`<link rel=stylesheet href=${css.fileName}>`);
   });
 
+  test("updates root-relative references to root-level finalized assets", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const resolved = outputOptionsResult(plugin, {
+      assetFileNames: "[name]-[hash][extname]",
+    });
+
+    if (typeof resolved.assetFileNames !== "function") {
+      throw new Error("Expected an asset filename callback");
+    }
+
+    const preliminaryCssFileName = materializeHashPlaceholders(
+      resolved.assetFileNames({
+        name: "stylex.css",
+        source: `.${PREFIX}1{color:red}`,
+        type: "asset",
+      } as Rollup.PreRenderedAsset),
+      "csshash0",
+    )
+      .replace("[name]", "stylex")
+      .replace("[extname]", ".css");
+    const css = outputAsset(preliminaryCssFileName, `.${PREFIX}1{color:red}`);
+    const html = outputAsset(
+      "index.html",
+      `<link rel=stylesheet href=/${preliminaryCssFileName}>`,
+    );
+
+    runGenerateBundle(plugin, {
+      [css.fileName]: css,
+      [html.fileName]: html,
+    });
+
+    expect(css.fileName).not.toBe(preliminaryCssFileName);
+    expect(html.source).toBe(`<link rel=stylesheet href=/${css.fileName}>`);
+  });
+
+  test("updates double-quoted references to filenames containing apostrophes", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const resolved = outputOptionsResult(plugin, {
+      assetFileNames: "assets/[name]-[hash][extname]",
+    });
+
+    if (typeof resolved.assetFileNames !== "function") {
+      throw new Error("Expected an asset filename callback");
+    }
+
+    const preliminaryCssFileName = materializeHashPlaceholders(
+      resolved.assetFileNames({
+        name: "it's.css",
+        source: `.${PREFIX}1{color:red}`,
+        type: "asset",
+      } as Rollup.PreRenderedAsset),
+      "csshash0",
+    )
+      .replace("[name]", "it's")
+      .replace("[extname]", ".css");
+    const css = outputAsset(preliminaryCssFileName, `.${PREFIX}1{color:red}`);
+    const html = outputAsset(
+      "index.html",
+      `<link rel="stylesheet" href="${preliminaryCssFileName}">`,
+    );
+
+    runGenerateBundle(plugin, {
+      [css.fileName]: css,
+      [html.fileName]: html,
+    });
+
+    expect(css.fileName).not.toBe(preliminaryCssFileName);
+    expect(html.source).toBe(
+      `<link rel="stylesheet" href="${css.fileName}">`,
+    );
+  });
+
   test("rewrites generated class names in JavaScript emitted as an asset", () => {
     const chunk = outputChunk(
       [
@@ -665,6 +737,57 @@ describe("stylexMangleClassNames", () => {
     const rewrittenAfterColumn = rewritten.indexOf("globalThis.afterValue");
     const originalPosition = new SourceMapConsumer(
       JSON.parse(String(mapAsset.source)) as RawSourceMap,
+    ).originalPositionFor({ column: rewrittenAfterColumn, line: 1 });
+
+    expect(rewritten).toContain('globalThis.workerClass = "a";');
+    expect(originalPosition).toMatchObject({
+      column: afterColumn,
+      line: 1,
+      source: "worker-source.js",
+    });
+  });
+
+  test("composes URI-encoded block inline source maps containing asterisks", () => {
+    const source = `globalThis.workerClass = "${PREFIX}1";globalThis.afterValue = 1;`;
+    const afterColumn = source.indexOf("globalThis.afterValue");
+    const sourceMap = new SourceMapGenerator({ file: "worker.js" });
+
+    for (const column of [0, afterColumn]) {
+      sourceMap.addMapping({
+        generated: { column, line: 1 },
+        original: { column, line: 1 },
+        source: "worker-source.js",
+      });
+    }
+
+    sourceMap.setSourceContent("worker-source.js", `${source}\n/* a*b */`);
+    const sourceMapUrl = `data:application/json,${encodeURIComponent(
+      sourceMap.toString(),
+    )}`;
+    const chunk = outputChunk(`inject({ ltr: ".${PREFIX}1{color:red}" });`);
+    const asset = outputAsset(
+      "worker.js",
+      `${source}\n/*# sourceMappingURL=${sourceMapUrl} */`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [chunk.fileName]: chunk,
+      [asset.fileName]: asset,
+    });
+
+    const rewritten = String(asset.source);
+    const rewrittenAfterColumn = rewritten.indexOf("globalThis.afterValue");
+    const rewrittenInlineMap = rewritten.match(
+      /sourceMappingURL=(data:application\/json,[^\s]+)\s*\*\//,
+    )?.[1];
+
+    if (rewrittenInlineMap === undefined) {
+      throw new Error("Expected a URI-encoded inline source map");
+    }
+
+    const outputMap = decodeURIComponent(rewrittenInlineMap.split(",", 2)[1] ?? "");
+    const originalPosition = new SourceMapConsumer(
+      JSON.parse(outputMap) as RawSourceMap,
     ).originalPositionFor({ column: rewrittenAfterColumn, line: 1 });
 
     expect(rewritten).toContain('globalThis.workerClass = "a";');
