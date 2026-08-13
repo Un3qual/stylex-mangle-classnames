@@ -70,6 +70,10 @@ function isCssAsset({ output }: TextAsset): boolean {
   return output.fileName.endsWith(".css");
 }
 
+function isJavaScriptAsset({ output }: TextAsset): boolean {
+  return /\.(?:cjs|js|mjs)$/.test(output.fileName);
+}
+
 function contentHash(source: string, hashCharacters: HashCharacters): string {
   const digest = createHash("sha256").update(source).digest();
 
@@ -173,13 +177,14 @@ function sourceMapAsset(
   return output?.type === "asset" ? output : null;
 }
 
-function rewriteChunkWithSourceMap(
+function rewriteJavaScriptWithSourceMap(
   bundle: Rollup.OutputBundle,
-  chunk: Rollup.OutputChunk,
+  outputFileName: string,
   source: string,
   edits: readonly StylexClassNameEdit[],
+  explicitSourceMapFileName?: string | null,
 ): string {
-  const rewrite = rewriteWithSourceMap(source, chunk.fileName, edits);
+  const rewrite = rewriteWithSourceMap(source, outputFileName, edits);
   const directive = source.match(javascriptSourceMapDirectivePattern);
   const sourceMapUrl = directive?.[1];
 
@@ -207,9 +212,9 @@ function rewriteChunkWithSourceMap(
 
   const mapAsset = sourceMapAsset(
     bundle,
-    chunk.fileName,
+    outputFileName,
     sourceMapUrl,
-    chunk.sourcemapFileName,
+    explicitSourceMapFileName,
   );
 
   if (mapAsset !== null) {
@@ -297,6 +302,8 @@ function metadataValues(output: OutputFile): string[] {
     ...(output.dynamicImports ?? []),
     ...(compatible.implicitlyLoadedBefore ?? []),
     ...(compatible.referencedFiles ?? []),
+    ...(compatible.viteMetadata?.importedAssets ?? []),
+    ...(compatible.viteMetadata?.importedCss ?? []),
     ...(output.sourcemapFileName === null || output.sourcemapFileName === undefined
       ? []
       : [output.sourcemapFileName]),
@@ -410,7 +417,7 @@ function outputDependencies(
   preliminaryFileNames: ReadonlyMap<OutputFile, string>,
   markers: ReadonlyMap<string, HashMarker>,
 ): Map<OutputFile, Set<OutputFile>> {
-  const outputBySentinel = new Map<string, OutputFile>();
+  const outputsBySentinel = new Map<string, Set<OutputFile>>();
 
   for (const output of outputs) {
     const fileName = requiredMapValue(
@@ -420,7 +427,9 @@ function outputDependencies(
     );
 
     for (const marker of markersInFileName(fileName, markers)) {
-      outputBySentinel.set(marker.sentinel, output);
+      const markerOutputs = outputsBySentinel.get(marker.sentinel) ?? new Set();
+      markerOutputs.add(output);
+      outputsBySentinel.set(marker.sentinel, markerOutputs);
     }
   }
 
@@ -431,9 +440,9 @@ function outputDependencies(
 
       for (const value of values) {
         for (const sentinel of value.match(hashMarkerSentinelPattern) ?? []) {
-          const dependency = outputBySentinel.get(sentinel);
+          const markerOutputs = outputsBySentinel.get(sentinel);
 
-          if (dependency !== undefined) {
+          for (const dependency of markerOutputs ?? []) {
             dependencies.add(dependency);
           }
         }
@@ -746,6 +755,22 @@ function updateOutputFileNameReferences(
       if (compatible.referencedFiles !== undefined) {
         compatible.referencedFiles = compatible.referencedFiles.map((value) =>
           replaceFileNameReferences(value, replacements),
+        );
+      }
+
+      if (compatible.viteMetadata?.importedAssets !== undefined) {
+        compatible.viteMetadata.importedAssets = new Set(
+          [...compatible.viteMetadata.importedAssets].map((value) =>
+            replaceFileNameReferences(value, replacements),
+          ),
+        );
+      }
+
+      if (compatible.viteMetadata?.importedCss !== undefined) {
+        compatible.viteMetadata.importedCss = new Set(
+          [...compatible.viteMetadata.importedCss].map((value) =>
+            replaceFileNameReferences(value, replacements),
+          ),
         );
       }
 
@@ -1150,11 +1175,12 @@ export default function stylexMangleClassNames(
             );
 
             if (result.changed) {
-              output.code = rewriteChunkWithSourceMap(
+              output.code = rewriteJavaScriptWithSourceMap(
                 bundle,
-                output,
+                output.fileName,
                 output.code,
                 result.edits,
+                output.sourcemapFileName,
               );
             }
           }
@@ -1178,9 +1204,23 @@ export default function stylexMangleClassNames(
           const result = rewriteStylexClassNames(source, classNamePrefix, classNames);
 
           if (result.changed) {
-            output.source = isCssAsset({ output, source })
-              ? rewriteCssWithSourceMap(bundle, output, source, result.edits)
-              : result.code;
+            if (isCssAsset({ output, source })) {
+              output.source = rewriteCssWithSourceMap(
+                bundle,
+                output,
+                source,
+                result.edits,
+              );
+            } else if (isJavaScriptAsset({ output, source })) {
+              output.source = rewriteJavaScriptWithSourceMap(
+                bundle,
+                output.fileName,
+                source,
+                result.edits,
+              );
+            } else {
+              output.source = result.code;
+            }
           }
         }
 

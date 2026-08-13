@@ -34,7 +34,15 @@ function atomicClassSelectorPattern(classNamePrefix: string): RegExp {
   return new RegExp(`\\.(${prefix}(?:0|[1-9a-z][0-9a-z]*))(?![${CSS_IDENTIFIER_CHARACTER}])`, "g");
 }
 
-const classSelectorPattern = /\.([_A-Za-z][_A-Za-z0-9-]*)/g;
+const cssEscapePattern = String.raw`\\(?:[0-9A-Fa-f]{1,6}[ \t\r\n\f]?|[^\r\n\f])`;
+const cssIdentifierStartPattern =
+  String.raw`(?:[_A-Za-z\u0080-\uFFFF]|${cssEscapePattern}|-(?:[_A-Za-z\u0080-\uFFFF-]|${cssEscapePattern}))`;
+const cssIdentifierRestPattern =
+  String.raw`(?:[_A-Za-z0-9\u0080-\uFFFF-]|${cssEscapePattern})*`;
+const classSelectorPattern = new RegExp(
+  String.raw`\.(${cssIdentifierStartPattern}${cssIdentifierRestPattern})`,
+  "g",
+);
 
 const stylexRulePattern = /\b(?:ltr|rtl)\s*:\s*(?:`([^`]*)`|"((?:\\.|[^"\\])*)")/g;
 
@@ -91,6 +99,29 @@ function selectorClassText(selector: string): string {
   return result;
 }
 
+function decodeCssIdentifier(identifier: string): string {
+  return identifier.replace(
+    /\\([0-9A-Fa-f]{1,6}[ \t\r\n\f]?|[^\r\n\f])/g,
+    (_escape, escaped: string) => {
+      if (!/^[0-9A-Fa-f]/.test(escaped)) {
+        return escaped;
+      }
+
+      const codePoint = Number.parseInt(escaped.trim(), 16);
+
+      if (
+        codePoint === 0 ||
+        codePoint > 0x10ffff ||
+        (codePoint >= 0xd800 && codePoint <= 0xdfff)
+      ) {
+        return "\uFFFD";
+      }
+
+      return String.fromCodePoint(codePoint);
+    },
+  );
+}
+
 function isStylexConstKey(source: string, classNameOffset: number): boolean {
   const keyOffset = source.lastIndexOf("constKey", classNameOffset);
 
@@ -143,7 +174,11 @@ export function mangleStylexClassName(
   return mangled;
 }
 
-function findClassNamesInSelectors(source: string, pattern: RegExp): Set<string> {
+function findClassNamesInSelectors(
+  source: string,
+  pattern: RegExp,
+  normalize: (className: string) => string = (className) => className,
+): Set<string> {
   const classNames = new Set<string>();
 
   postcss.parse(source).walkRules((rule) => {
@@ -152,7 +187,7 @@ function findClassNamesInSelectors(source: string, pattern: RegExp): Set<string>
         const className = match[1];
 
         if (className !== undefined) {
-          classNames.add(className);
+          classNames.add(normalize(className));
         }
       }
     }
@@ -162,7 +197,7 @@ function findClassNamesInSelectors(source: string, pattern: RegExp): Set<string>
 }
 
 export function findCssClassNamesInSelectors(source: string): Set<string> {
-  return findClassNamesInSelectors(source, classSelectorPattern);
+  return findClassNamesInSelectors(source, classSelectorPattern, decodeCssIdentifier);
 }
 
 export function findStylexClassNamesInSelectors(

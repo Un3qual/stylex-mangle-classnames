@@ -1,4 +1,5 @@
 import { posix } from "node:path";
+import { SourceMapConsumer, SourceMapGenerator, type RawSourceMap } from "source-map-js";
 import { describe, expect, test } from "vitest";
 import { parseAst, type Plugin, type ResolvedConfig, type Rollup } from "vite";
 import { findStylexClassNamesInSelectors } from "../src/class-names.js";
@@ -453,6 +454,65 @@ describe("stylexMangleClassNames", () => {
     expect(compatibleEntry.referencedFiles).toEqual([css.fileName]);
   });
 
+  test("updates Vite filename metadata when outputs are finalized", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const resolved = outputOptionsResult(plugin, {
+      assetFileNames: "assets/[name]-[hash][extname]",
+      entryFileNames: "assets/[name]-[hash].js",
+    });
+
+    if (
+      typeof resolved.assetFileNames !== "function" ||
+      typeof resolved.entryFileNames !== "function"
+    ) {
+      throw new Error("Expected filename callbacks");
+    }
+
+    const cssName = materializeHashPlaceholders(
+      resolved.assetFileNames({
+        name: "stylex.css",
+        source: `.${PREFIX}1{color:red}`,
+        type: "asset",
+      } as Rollup.PreRenderedAsset),
+      "csshash0",
+    )
+      .replace("[name]", "stylex")
+      .replace("[extname]", ".css");
+    const assetName = materializeHashPlaceholders(
+      resolved.assetFileNames({
+        name: "data.txt",
+        source: "data",
+        type: "asset",
+      } as Rollup.PreRenderedAsset),
+      "assethas",
+    )
+      .replace("[name]", "data")
+      .replace("[extname]", ".txt");
+    const entryName = materializeHashPlaceholders(
+      resolved.entryFileNames({ name: "entry" } as Rollup.PreRenderedChunk),
+      "entryhas",
+    ).replace("[name]", "entry");
+    const css = outputAsset(cssName, `.${PREFIX}1{color:red}`);
+    const asset = outputAsset(assetName, "data");
+    const entry = outputChunk(`globalThis.className = "${PREFIX}1";`);
+    entry.fileName = entryName;
+    const viteEntry = entry;
+    viteEntry.viteMetadata = {
+      __modules: entry.modules,
+      importedAssets: new Set([assetName]),
+      importedCss: new Set([cssName]),
+    };
+
+    runGenerateBundle(plugin, {
+      [assetName]: asset,
+      [cssName]: css,
+      [entryName]: entry,
+    });
+
+    expect(viteEntry.viteMetadata.importedAssets).toEqual(new Set([asset.fileName]));
+    expect(viteEntry.viteMetadata.importedCss).toEqual(new Set([css.fileName]));
+  });
+
   test("rewrites generated class names in JavaScript emitted as an asset", () => {
     const chunk = outputChunk(
       [
@@ -472,6 +532,63 @@ describe("stylexMangleClassNames", () => {
 
     expect(asset.source).toBe('globalThis.workerClass = "a";');
   });
+
+  test.each(["external", "inline"] as const)(
+    "composes %s source maps for JavaScript emitted as an asset",
+    (mode) => {
+      const source = `globalThis.workerClass = "${PREFIX}1";globalThis.afterValue = 1;`;
+      const afterColumn = source.indexOf("globalThis.afterValue");
+      const sourceMap = new SourceMapGenerator({ file: "worker.js" });
+
+      for (const column of [0, afterColumn]) {
+        sourceMap.addMapping({
+          generated: { column, line: 1 },
+          original: { column, line: 1 },
+          source: "worker-source.js",
+        });
+      }
+
+      sourceMap.setSourceContent("worker-source.js", source);
+      const serializedMap = sourceMap.toString();
+      const sourceMapUrl =
+        mode === "inline"
+          ? `data:application/json;base64,${Buffer.from(serializedMap).toString("base64")}`
+          : "worker.js.map";
+      const chunk = outputChunk(`inject({ ltr: ".${PREFIX}1{color:red}" });`);
+      const asset = outputAsset(
+        "worker.js",
+        `${source}\n//# sourceMappingURL=${sourceMapUrl}`,
+      );
+      const mapAsset = outputAsset("worker.js.map", serializedMap);
+      const bundle: Rollup.OutputBundle = {
+        [chunk.fileName]: chunk,
+        [asset.fileName]: asset,
+        ...(mode === "external" ? { [mapAsset.fileName]: mapAsset } : {}),
+      };
+
+      runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), bundle);
+
+      const rewritten = String(asset.source);
+      const rewrittenAfterColumn = rewritten.indexOf("globalThis.afterValue");
+      const rewrittenInlineMap = rewritten.match(
+        /sourceMappingURL=data:application\/json;base64,([^\n]+)/,
+      )?.[1];
+      const outputMap =
+        mode === "inline"
+          ? Buffer.from(rewrittenInlineMap ?? "", "base64").toString("utf8")
+          : String(mapAsset.source);
+      const originalPosition = new SourceMapConsumer(
+        JSON.parse(outputMap) as RawSourceMap,
+      ).originalPositionFor({ column: rewrittenAfterColumn, line: 1 });
+
+      expect(rewritten).toContain('globalThis.workerClass = "a";');
+      expect(originalPosition).toMatchObject({
+        column: afterColumn,
+        line: 1,
+        source: "worker-source.js",
+      });
+    },
+  );
 
   test("updates finalized chunk filenames inside inline source maps", () => {
     const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
@@ -518,6 +635,47 @@ describe("stylexMangleClassNames", () => {
 
     expect(chunk.fileName).not.toBe(preliminaryFileName);
     expect(finalizedMap.file).toBe(chunk.fileName);
+  });
+
+  test("finalizes a chunk and its default source map with their shared hash", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const resolved = outputOptionsResult(plugin, {
+      entryFileNames: "assets/[name]-[hash].js",
+    });
+
+    if (typeof resolved.entryFileNames !== "function") {
+      throw new Error("Expected an entry filename callback");
+    }
+
+    const preliminaryFileName = materializeHashPlaceholders(
+      resolved.entryFileNames({ name: "entry" } as Rollup.PreRenderedChunk),
+      "native00",
+    ).replace("[name]", "entry");
+    const preliminaryMapFileName = `${preliminaryFileName}.map`;
+    const chunk = outputChunk(
+      `globalThis.value = 1;\n//# sourceMappingURL=${posix.basename(preliminaryMapFileName)}`,
+    );
+    chunk.fileName = preliminaryFileName;
+    chunk.sourcemapFileName = preliminaryMapFileName;
+    const map = outputAsset(
+      preliminaryMapFileName,
+      JSON.stringify({
+        file: preliminaryFileName,
+        mappings: "",
+        names: [],
+        sources: ["entry.ts"],
+        version: 3,
+      }),
+    );
+
+    runGenerateBundle(plugin, {
+      [preliminaryFileName]: chunk,
+      [preliminaryMapFileName]: map,
+    });
+
+    expect(map.fileName).toBe(`${chunk.fileName}.map`);
+    expect(chunk.code).toContain(`sourceMappingURL=${posix.basename(map.fileName)}`);
+    expect(JSON.parse(String(map.source))).toMatchObject({ file: chunk.fileName });
   });
 
   test("fails instead of overwriting outputs when short hashes collide", () => {
@@ -925,6 +1083,34 @@ describe("stylexMangleClassNames", () => {
   test("fails when a generated short name collides with authored CSS", () => {
     const javascript = outputChunk(`inject({ ltr: ".${PREFIX}1{color:red}" });`);
     const css = outputAsset("styles.css", `.${PREFIX}1{color:red}.a{color:blue}`);
+
+    expect(() =>
+      runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+        [javascript.fileName]: javascript,
+        [css.fileName]: css,
+      }),
+    ).toThrow('generated class ".a" would collide with authored CSS');
+  });
+
+  test("does not treat an escaped authored class prefix as a collision", () => {
+    const javascript = outputChunk(`inject({ ltr: ".${PREFIX}1{color:red}" });`);
+    const css = outputAsset(
+      "styles.css",
+      `.${PREFIX}1{color:red}.a\\:hover{color:blue}`,
+    );
+
+    expect(() =>
+      runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+        [javascript.fileName]: javascript,
+        [css.fileName]: css,
+      }),
+    ).not.toThrow();
+    expect(css.source).toBe(".a{color:red}.a\\:hover{color:blue}");
+  });
+
+  test("detects a collision with an escaped authored class", () => {
+    const javascript = outputChunk(`inject({ ltr: ".${PREFIX}1{color:red}" });`);
+    const css = outputAsset("styles.css", `.${PREFIX}1{color:red}.\\61{color:blue}`);
 
     expect(() =>
       runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
