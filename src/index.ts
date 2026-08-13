@@ -12,6 +12,7 @@ import {
   rewriteStylexClassNamesInHtml,
   type StylexClassNameEdit,
 } from "./class-names.js";
+import { findHtmlStartTags } from "./html.js";
 import { composeWithSourceMap, rewriteWithSourceMap } from "./source-maps.js";
 
 export type StylexMangleClassNamesOptions = {
@@ -52,8 +53,6 @@ const sourceMapDirectivePattern =
 const javascriptSourceMapDirectivePattern =
   /\/\/[#@]\s*sourceMappingURL=([^\s]+)\s*$/;
 const hashMarkerSentinelPattern = /__STYLEX_HASH_[0-9a-z]+_[0-9a-z]+__/g;
-const htmlElementPattern =
-  /<!--[\s\S]*?-->|<(script|style|textarea|title)\b[^>]*>[\s\S]*?<\/\1\s*>|<[A-Za-z][^>]*>/gi;
 const htmlUnquotedUrlAttributePattern =
   /(\s(?:action|background|cite|data|formaction|href|manifest|poster|src)\s*=\s*)([^\s"'`=<>]+)/gi;
 const htmlSrcsetAttributePattern =
@@ -203,27 +202,55 @@ function replaceFileNameReference(
     }
   }
 
-  return value;
-}
+  let decodedPath: string;
 
-function htmlStartTags(value: string): string[] {
-  const tags: string[] = [];
+  try {
+    decodedPath = decodeURIComponent(path);
+  } catch {
+    return value;
+  }
 
-  for (const match of value.matchAll(htmlElementPattern)) {
-    const element = match[0];
+  if (decodedPath === path) {
+    return value;
+  }
 
-    if (element.startsWith("<!--")) {
+  const encodePath = (candidate: string): string =>
+    candidate.split("/").map(encodeURIComponent).join("/");
+
+  for (const [before, after] of orderedReplacements) {
+    if (decodedPath === before) {
+      return `${encodePath(after)}${suffix}`;
+    }
+
+    if (!decodedPath.endsWith(before)) {
       continue;
     }
 
-    const tagEnd = element.indexOf(">");
+    const decodedPrefix = decodedPath.slice(0, -before.length);
 
-    if (tagEnd >= 0) {
-      tags.push(element.slice(0, tagEnd + 1));
+    if (
+      !/^(?:(?:\.\.?\/)+|\/(?:[^\s]*\/)?|(?:https?:)?\/\/[^\s]+\/)$/i.test(
+        decodedPrefix,
+      )
+    ) {
+      continue;
+    }
+
+    for (let split = 0; split <= path.length; split += 1) {
+      try {
+        if (
+          decodeURIComponent(path.slice(0, split)) === decodedPrefix &&
+          decodeURIComponent(path.slice(split)) === before
+        ) {
+          return `${path.slice(0, split)}${encodePath(after)}${suffix}`;
+        }
+      } catch {
+        // A split inside a percent escape is not a valid boundary.
+      }
     }
   }
 
-  return tags;
+  return value;
 }
 
 type StructuredReferenceKind = "generic" | "html" | "javascript";
@@ -264,6 +291,58 @@ function javascriptFileNameReferenceTokens(value: string): TextToken[] {
       /\b(?:from|import)\s*$/.test(before)
     );
   });
+}
+
+function javascriptFileNameReferenceEdits(
+  value: string,
+  replacements: ReadonlyMap<string, string>,
+): StylexClassNameEdit[] {
+  const edits: StylexClassNameEdit[] = [];
+
+  for (const token of javascriptFileNameReferenceTokens(value)) {
+    const replacement = replaceFileNameReference(token.value, replacements);
+
+    if (replacement !== token.value) {
+      edits.push({ ...token, replacement });
+    }
+  }
+
+  for (const match of value.matchAll(/((?:sourceMappingURL|sourceURL)=)([^\s*]+)/g)) {
+    const prefix = match[1] ?? "";
+    const token = match[2];
+
+    if (token === undefined) {
+      continue;
+    }
+
+    const start = match.index + prefix.length;
+    const end = start + token.length;
+
+    if (edits.some((edit) => start < edit.end && end > edit.start)) {
+      continue;
+    }
+
+    const replacement = replaceFileNameReference(token, replacements);
+
+    if (replacement !== token) {
+      edits.push({ end, replacement, start });
+    }
+  }
+
+  return edits;
+}
+
+function applyTextEdits(
+  value: string,
+  edits: readonly StylexClassNameEdit[],
+): string {
+  let result = value;
+
+  for (const edit of [...edits].sort((left, right) => right.start - left.start)) {
+    result = `${result.slice(0, edit.start)}${edit.replacement}${result.slice(edit.end)}`;
+  }
+
+  return result;
 }
 
 function srcsetUrlTokens(value: string): TextToken[] {
@@ -349,8 +428,8 @@ function fileNameReferenceTokens(
   }
 
   if (kind === "html") {
-    for (const tag of htmlStartTags(value)) {
-      for (const match of tag.matchAll(htmlUnquotedUrlAttributePattern)) {
+    for (const tag of findHtmlStartTags(value)) {
+      for (const match of tag.source.matchAll(htmlUnquotedUrlAttributePattern)) {
         const token = match[2];
 
         if (token !== undefined) {
@@ -358,7 +437,7 @@ function fileNameReferenceTokens(
         }
       }
 
-      for (const match of tag.matchAll(htmlSrcsetAttributePattern)) {
+      for (const match of tag.source.matchAll(htmlSrcsetAttributePattern)) {
         const srcset = match[3] ?? match[4];
 
         if (srcset !== undefined) {
@@ -376,12 +455,16 @@ function replaceStructuredFileNameReferences(
   replacements: ReadonlyMap<string, string>,
   kind: StructuredReferenceKind,
 ): string {
+  if (kind === "javascript") {
+    return applyTextEdits(
+      value,
+      javascriptFileNameReferenceEdits(value, replacements),
+    );
+  }
+
   let replaceQuoted = value;
 
-  const quotedReferences =
-    kind === "javascript"
-      ? javascriptFileNameReferenceTokens(value)
-      : quotedTokens(value);
+  const quotedReferences = quotedTokens(value);
 
   for (const token of quotedReferences.reverse()) {
     const replacement = replaceFileNameReference(token.value, replacements);
@@ -391,16 +474,13 @@ function replaceStructuredFileNameReferences(
     }
   }
 
-  const replaceUrls =
-    kind === "javascript"
-      ? replaceQuoted
-      : replaceQuoted.replace(
-          /\burl\(\s*([^"')\s][^)]*?)\s*\)/gi,
-          (match, token: string) => {
-            const replacement = replaceFileNameReference(token, replacements);
-            return replacement === token ? match : match.replace(token, replacement);
-          },
-        );
+  const replaceUrls = replaceQuoted.replace(
+    /\burl\(\s*([^"')\s][^)]*?)\s*\)/gi,
+    (match, token: string) => {
+      const replacement = replaceFileNameReference(token, replacements);
+      return replacement === token ? match : match.replace(token, replacement);
+    },
+  );
 
   const replaceDirectives = replaceUrls.replace(
     /((?:sourceMappingURL|sourceURL)=)([^\s*]+)/g,
@@ -414,19 +494,10 @@ function replaceStructuredFileNameReferences(
     return replaceDirectives;
   }
 
-  return replaceDirectives.replace(htmlElementPattern, (element) => {
-    if (element.startsWith("<!--")) {
-      return element;
-    }
+  let updatedHtml = replaceDirectives;
 
-    const tagEnd = element.indexOf(">");
-
-    if (tagEnd < 0) {
-      return element;
-    }
-
-    const tag = element.slice(0, tagEnd + 1);
-    const updatedUrlAttributes = tag.replace(
+  for (const tag of findHtmlStartTags(replaceDirectives).reverse()) {
+    const updatedUrlAttributes = tag.source.replace(
       htmlUnquotedUrlAttributePattern,
       (match, prefix: string, token: string) => {
         const replacement = replaceFileNameReference(token, replacements);
@@ -462,8 +533,22 @@ function replaceStructuredFileNameReferences(
       },
     );
 
-    return `${updatedTag}${element.slice(tagEnd + 1)}`;
-  });
+    updatedHtml = `${updatedHtml.slice(0, tag.start)}${updatedTag}${updatedHtml.slice(tag.end)}`;
+  }
+
+  return updatedHtml;
+}
+
+function replaceLastOccurrence(
+  value: string,
+  search: string,
+  replacement: string,
+): string {
+  const index = value.lastIndexOf(search);
+
+  return index < 0
+    ? value
+    : `${value.slice(0, index)}${replacement}${value.slice(index + search.length)}`;
 }
 
 function replaceSourceMapFileNameReferences(
@@ -545,6 +630,27 @@ function javascriptSourceMapUrl(source: string): string | undefined {
   );
 }
 
+function composePreservingSourceMapFile(
+  rewrite: ReturnType<typeof rewriteWithSourceMap>,
+  inputMap: string,
+): string {
+  const composed = composeWithSourceMap(rewrite, inputMap);
+
+  try {
+    const input = JSON.parse(inputMap) as { file?: unknown };
+
+    if (typeof input.file !== "string") {
+      return composed;
+    }
+
+    const output = JSON.parse(composed) as { file?: unknown };
+    output.file = input.file;
+    return JSON.stringify(output);
+  } catch {
+    return composed;
+  }
+}
+
 function rewriteJavaScriptWithSourceMap(
   bundle: Rollup.OutputBundle,
   outputFileName: string,
@@ -568,13 +674,13 @@ function rewriteJavaScriptWithSourceMap(
     const inputMap = inline[1]
       ? Buffer.from(inlineData, "base64").toString("utf8")
       : decodeURIComponent(inlineData);
-    const composed = composeWithSourceMap(rewrite, inputMap);
+    const composed = composePreservingSourceMapFile(rewrite, inputMap);
     const encoded = inline[1]
       ? Buffer.from(composed).toString("base64")
       : encodeURIComponent(composed);
     const updatedUrl = `data:application/json${inline[1] ? ";base64" : ""},${encoded}`;
 
-    return rewrite.code.replace(sourceMapUrl, updatedUrl);
+    return replaceLastOccurrence(rewrite.code, sourceMapUrl, updatedUrl);
   }
 
   const mapAsset = sourceMapAsset(
@@ -585,7 +691,7 @@ function rewriteJavaScriptWithSourceMap(
   );
 
   if (mapAsset !== null) {
-    mapAsset.source = composeWithSourceMap(
+    mapAsset.source = composePreservingSourceMapFile(
       rewrite,
       assetSourceToString(mapAsset.source),
     );
@@ -622,19 +728,19 @@ function rewriteCssWithSourceMap(
     const inputMap = inline[1]
       ? Buffer.from(inlineData, "base64").toString("utf8")
       : decodeURIComponent(inlineData);
-    const composed = composeWithSourceMap(rewrite, inputMap);
+    const composed = composePreservingSourceMapFile(rewrite, inputMap);
     const encoded = inline[1]
       ? Buffer.from(composed).toString("base64")
       : encodeURIComponent(composed);
     const updatedUrl = `data:application/json${inline[1] ? ";base64" : ""},${encoded}`;
 
-    return rewrite.code.replace(sourceMapUrl, updatedUrl);
+    return replaceLastOccurrence(rewrite.code, sourceMapUrl, updatedUrl);
   }
 
   const mapAsset = sourceMapAsset(bundle, asset.fileName, sourceMapUrl);
 
   if (mapAsset !== null) {
-    mapAsset.source = composeWithSourceMap(
+    mapAsset.source = composePreservingSourceMapFile(
       rewrite,
       assetSourceToString(mapAsset.source),
     );
@@ -769,7 +875,11 @@ function replaceInlineSourceMapFileNameReferences(
       ? Buffer.from(updatedMap).toString("base64")
       : encodeURIComponent(updatedMap);
 
-    return value.replace(sourceMapUrl, `${prefix}${updatedEncodedMap}`);
+    return replaceLastOccurrence(
+      value,
+      sourceMapUrl,
+      `${prefix}${updatedEncodedMap}`,
+    );
   } catch {
     return value;
   }
@@ -1138,16 +1248,26 @@ function assertUniqueFinalFileNames(
 }
 
 function updateOutputFileNameReferences(
+  bundle: Rollup.OutputBundle,
   outputs: readonly OutputFile[],
   replacements: ReadonlyMap<string, string>,
 ): void {
   for (const output of outputs) {
     if (output.type === "chunk") {
-      const updatedCode = replaceStructuredFileNameReferences(
+      const edits = javascriptFileNameReferenceEdits(
         output.code,
         replacements,
-        "javascript",
       );
+      const updatedCode =
+        edits.length === 0
+          ? output.code
+          : rewriteJavaScriptWithSourceMap(
+              bundle,
+              output.fileName,
+              output.code,
+              edits,
+              output.sourcemapFileName,
+            );
       output.code = replaceInlineSourceMapFileNameReferences(
         updatedCode,
         replacements,
@@ -1195,13 +1315,35 @@ function updateOutputFileNameReferences(
         );
       }
     } else if (typeof output.source === "string") {
-      const updatedSource = output.fileName.endsWith(".map")
-        ? replaceSourceMapFileNameReferences(output.source, replacements)
-        : replaceStructuredFileNameReferences(
-            output.source,
-            replacements,
-            structuredReferenceKind(output),
-          );
+      let updatedSource: string;
+
+      if (output.fileName.endsWith(".map")) {
+        updatedSource = replaceSourceMapFileNameReferences(
+          output.source,
+          replacements,
+        );
+      } else if (/\.(?:cjs|js|mjs)$/.test(output.fileName)) {
+        const edits = javascriptFileNameReferenceEdits(
+          output.source,
+          replacements,
+        );
+        updatedSource =
+          edits.length === 0
+            ? output.source
+            : rewriteJavaScriptWithSourceMap(
+                bundle,
+                output.fileName,
+                output.source,
+                edits,
+              );
+      } else {
+        updatedSource = replaceStructuredFileNameReferences(
+          output.source,
+          replacements,
+          structuredReferenceKind(output),
+        );
+      }
+
       output.source = replaceInlineSourceMapFileNameReferences(
         updatedSource,
         replacements,
@@ -1289,7 +1431,11 @@ function finalizeOutputHashMarkers(
     }
   }
 
-  updateOutputFileNameReferences(outputValues, finalizedFileNameReplacements);
+  updateOutputFileNameReferences(
+    bundle,
+    outputValues,
+    finalizedFileNameReplacements,
+  );
 
   for (const [, output] of outputs) {
     output.fileName = finalFileNames.get(output) ?? output.fileName;

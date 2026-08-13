@@ -1,4 +1,5 @@
 import postcss from "postcss";
+import { findHtmlStartTags } from "./html.js";
 
 const SHORT_CLASS_NAME_ALPHABET = "abcdefghijklmnopqrstuvwxyz";
 const CSS_IDENTIFIER_CHARACTER = "A-Za-z0-9_-";
@@ -457,30 +458,24 @@ export function rewriteStylexClassNamesInCssSelectors(
   };
 }
 
-const htmlElementPattern =
-  /<!--[\s\S]*?-->|<(script|style|textarea|title)\b[^>]*>[\s\S]*?<\/\1\s*>|<[A-Za-z][^>]*>/gi;
 const htmlClassAttributePattern =
   /(\sclass\s*=\s*)(?:(["'])((?:(?!\2)[^\r\n])*)\2|([^\s"'`=<>]+))/gi;
 
 function inlineCssFragmentsInHtml(source: string): SourceFragment[] {
   const fragments: SourceFragment[] = [];
 
-  for (const match of source.matchAll(htmlElementPattern)) {
-    if (match[1]?.toLowerCase() !== "style") {
-      continue;
-    }
-
-    const element = match[0];
-    const openingTagEnd = element.indexOf(">");
-    const closingTagStart = element.toLowerCase().lastIndexOf("</style");
-
-    if (openingTagEnd < 0 || closingTagStart < openingTagEnd) {
+  for (const tag of findHtmlStartTags(source)) {
+    if (
+      tag.tagName !== "style" ||
+      tag.contentStart === undefined ||
+      tag.contentEnd === undefined
+    ) {
       continue;
     }
 
     fragments.push({
-      source: element.slice(openingTagEnd + 1, closingTagStart),
-      start: match.index + openingTagEnd + 1,
+      source: source.slice(tag.contentStart, tag.contentEnd),
+      start: tag.contentStart,
     });
   }
 
@@ -498,20 +493,8 @@ export function rewriteStylexClassNamesInHtml(
 ): StylexRewriteResult {
   const edits: StylexClassNameEdit[] = [];
 
-  for (const elementMatch of source.matchAll(htmlElementPattern)) {
-    const element = elementMatch[0];
-
-    if (element.startsWith("<!--")) {
-      continue;
-    }
-
-    const tagEnd = element.indexOf(">");
-
-    if (tagEnd < 0) {
-      continue;
-    }
-
-    const startTag = element.slice(0, tagEnd + 1);
+  for (const tag of findHtmlStartTags(source)) {
+    const startTag = tag.source;
 
     for (const attributeMatch of startTag.matchAll(htmlClassAttributePattern)) {
       const value = attributeMatch[3] ?? attributeMatch[4];
@@ -523,7 +506,7 @@ export function rewriteStylexClassNamesInHtml(
       const prefix = attributeMatch[1] ?? "";
       const quote = attributeMatch[2] ?? "";
       const valueStart =
-        elementMatch.index + attributeMatch.index + prefix.length + quote.length;
+        tag.start + attributeMatch.index + prefix.length + quote.length;
       const rewrite = rewriteStylexClassNames(value, classNamePrefix, classNames);
 
       edits.push(
