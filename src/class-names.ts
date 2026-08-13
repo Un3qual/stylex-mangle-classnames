@@ -77,12 +77,42 @@ export function mangleStylexClassName(
   return mangled;
 }
 
+export function findStylexClassNamesInSelectors(
+  source: string,
+  classNamePrefix: string,
+): Set<string> {
+  const classNames = new Set<string>();
+
+  for (const match of source.matchAll(atomicClassSelectorPattern(classNamePrefix))) {
+    classNames.add(match[1]!);
+  }
+
+  return classNames;
+}
+
+export function findStylexClassNameReferences(
+  source: string,
+  classNamePrefix: string,
+): Set<string> {
+  const classNames = new Set<string>();
+
+  for (const match of source.matchAll(atomicClassPattern(classNamePrefix))) {
+    const classNameOffset = match.index + match[1]!.length;
+
+    if (!isStylexConstKey(source, classNameOffset)) {
+      classNames.add(match[2]!);
+    }
+  }
+
+  return classNames;
+}
+
 export function findStylexClassNamesInRules(source: string, classNamePrefix: string): Set<string> {
   const classNames = new Set<string>();
 
   for (const rule of findStylexRules(source)) {
-    for (const match of rule.matchAll(atomicClassSelectorPattern(classNamePrefix))) {
-      classNames.add(match[1]!);
+    for (const className of findStylexClassNamesInSelectors(rule, classNamePrefix)) {
+      classNames.add(className);
     }
   }
 

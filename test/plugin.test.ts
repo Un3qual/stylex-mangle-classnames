@@ -120,6 +120,23 @@ describe("stylexMangleClassNames", () => {
     expect(third.source).toBe('<main class="b a"></main>');
   });
 
+  test("discovers extracted StyleX classes from matching selectors and references", () => {
+    const javascript = outputChunk(`globalThis.className = "${PREFIX}1";`);
+    const css = outputAsset("styles.css", `.${PREFIX}1{color:red}`);
+    const html = outputAsset("index.html", `<main class="${PREFIX}1"></main>`);
+    const bundle = {
+      [javascript.fileName]: javascript,
+      [css.fileName]: css,
+      [html.fileName]: html,
+    };
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), bundle);
+
+    expect(javascript.code).toBe('globalThis.className = "a";');
+    expect(css.source).toBe(".a{color:red}");
+    expect(html.source).toBe('<main class="a"></main>');
+  });
+
   test("preserves StyleX constants, custom properties, keyframes, and unrelated classes", () => {
     const atomic = `${PREFIX}1dmbf1k`;
     const spacedConstKey = `register({ constKey${" ".repeat(40)}:${" ".repeat(40)}"${atomic}" });`;
@@ -172,8 +189,30 @@ describe("stylexMangleClassNames", () => {
     expect(css.source).toBe(`.${PREFIX}123{color:red}`);
   });
 
+  test("preserves prefix-shaped application data without a matching CSS selector", () => {
+    const javascript = outputChunk(`globalThis.productId = "${PREFIX}123";`);
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [javascript.fileName]: javascript,
+    });
+
+    expect(javascript.code).toBe(`globalThis.productId = "${PREFIX}123";`);
+  });
+
   test("fails when a generated short name collides with authored CSS", () => {
     const javascript = outputChunk(`inject({ ltr: ".${PREFIX}1{color:red}" });`);
+    const css = outputAsset("styles.css", `.${PREFIX}1{color:red}.a{color:blue}`);
+
+    expect(() =>
+      runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+        [javascript.fileName]: javascript,
+        [css.fileName]: css,
+      }),
+    ).toThrow('generated class ".a" would collide with authored CSS');
+  });
+
+  test("fails when an extracted generated short name collides with authored CSS", () => {
+    const javascript = outputChunk(`globalThis.className = "${PREFIX}1";`);
     const css = outputAsset("styles.css", `.${PREFIX}1{color:red}.a{color:blue}`);
 
     expect(() =>

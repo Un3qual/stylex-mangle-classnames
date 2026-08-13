@@ -2,7 +2,9 @@ import { readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { Plugin, ResolvedConfig, Rollup } from "vite";
 import {
+  findStylexClassNameReferences,
   findStylexClassNamesInRules,
+  findStylexClassNamesInSelectors,
   mangleStylexClassName,
   rewriteStylexClassNames,
 } from "./class-names.js";
@@ -37,6 +39,10 @@ function textOutputs(bundle: Rollup.OutputBundle): TextOutput[] {
   }
 
   return outputs;
+}
+
+function isCssOutput({ output }: TextOutput): boolean {
+  return output.type === "asset" && output.fileName.endsWith(".css");
 }
 
 function authoredCssClasses(source: string): Set<string> {
@@ -102,7 +108,13 @@ export default function stylexMangleClassNames(
     }
   }
 
-  function registerClassNames(sources: readonly string[]): void {
+  function registerClassNames(originals: ReadonlySet<string>): void {
+    for (const original of [...originals].sort()) {
+      rememberClassName(original);
+    }
+  }
+
+  function registerClassNamesFromRules(sources: readonly string[]): void {
     const originals = new Set<string>();
 
     for (const source of sources) {
@@ -111,9 +123,39 @@ export default function stylexMangleClassNames(
       }
     }
 
-    for (const original of [...originals].sort()) {
-      rememberClassName(original);
+    registerClassNames(originals);
+  }
+
+  function registerClassNamesFromOutputs(outputs: readonly TextOutput[]): void {
+    const originals = new Set<string>();
+    const selectors = new Set<string>();
+    const references = new Set<string>();
+
+    for (const { source } of outputs) {
+      for (const original of findStylexClassNamesInRules(source, classNamePrefix)) {
+        originals.add(original);
+      }
     }
+
+    for (const { source } of outputs.filter(isCssOutput)) {
+      for (const selector of findStylexClassNamesInSelectors(source, classNamePrefix)) {
+        selectors.add(selector);
+      }
+    }
+
+    for (const { source } of outputs.filter((output) => !isCssOutput(output))) {
+      for (const reference of findStylexClassNameReferences(source, classNamePrefix)) {
+        references.add(reference);
+      }
+    }
+
+    for (const selector of selectors) {
+      if (references.has(selector)) {
+        originals.add(selector);
+      }
+    }
+
+    registerClassNames(originals);
   }
 
   function assertNoAuthoredCssCollisions(
@@ -134,11 +176,7 @@ export default function stylexMangleClassNames(
   function rewriteBundle(this: Rollup.PluginContext, bundle: Rollup.OutputBundle): void {
     const outputs = textOutputs(bundle);
 
-    registerClassNames(
-      outputs
-        .filter(({ output }) => output.type === "chunk")
-        .map(({ source }) => source),
-    );
+    registerClassNamesFromOutputs(outputs);
     assertNoAuthoredCssCollisions(
       this,
       outputs
@@ -220,7 +258,7 @@ export default function stylexMangleClassNames(
         return null;
       }
 
-      registerClassNames([code]);
+      registerClassNamesFromRules([code]);
       const result = rewriteStylexClassNames(code, classNamePrefix, classNames);
 
       return result.changed ? { code: result.code, map: null } : null;
