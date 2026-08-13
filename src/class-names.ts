@@ -15,6 +15,11 @@ export type StylexClassNameEdit = {
   start: number;
 };
 
+type SourceFragment = {
+  source: string;
+  start: number;
+};
+
 function escapeRegularExpression(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -174,6 +179,49 @@ export function mangleStylexClassName(
   return mangled;
 }
 
+const selectorAtRuleNames = new Set(["custom-selector", "nest", "scope"]);
+
+function cssSelectorFragments(source: string): SourceFragment[] {
+  const fragments: SourceFragment[] = [];
+  const root = postcss.parse(source);
+
+  root.walkRules((rule) => {
+    const start = rule.source?.start?.offset;
+
+    if (start === undefined) {
+      return;
+    }
+
+    fragments.push({
+      source: rule.raws.selector?.raw ?? rule.selector,
+      start,
+    });
+  });
+
+  root.walkAtRules((atRule) => {
+    if (!selectorAtRuleNames.has(atRule.name.toLowerCase())) {
+      return;
+    }
+
+    const nodeStart = atRule.source?.start?.offset;
+
+    if (nodeStart === undefined) {
+      return;
+    }
+
+    fragments.push({
+      source: atRule.raws.params?.raw ?? atRule.params,
+      start:
+        nodeStart +
+        1 +
+        atRule.name.length +
+        (atRule.raws.afterName ?? "").length,
+    });
+  });
+
+  return fragments;
+}
+
 function findClassNamesInSelectors(
   source: string,
   pattern: RegExp,
@@ -181,17 +229,15 @@ function findClassNamesInSelectors(
 ): Set<string> {
   const classNames = new Set<string>();
 
-  postcss.parse(source).walkRules((rule) => {
-    for (const selector of rule.selectors) {
-      for (const match of selectorClassText(selector).matchAll(pattern)) {
-        const className = match[1];
+  for (const fragment of cssSelectorFragments(source)) {
+    for (const match of selectorClassText(fragment.source).matchAll(pattern)) {
+      const className = match[1];
 
-        if (className !== undefined) {
-          classNames.add(normalize(className));
-        }
+      if (className !== undefined) {
+        classNames.add(normalize(className));
       }
     }
-  });
+  }
 
   return classNames;
 }
@@ -374,4 +420,141 @@ export function rewriteStylexClassNames(
   );
 
   return { changed, code, edits };
+}
+
+function applyStylexClassNameEdits(
+  source: string,
+  edits: readonly StylexClassNameEdit[],
+): string {
+  let result = source;
+
+  for (const edit of [...edits].sort((left, right) => right.start - left.start)) {
+    result = `${result.slice(0, edit.start)}${edit.replacement}${result.slice(edit.end)}`;
+  }
+
+  return result;
+}
+
+export function rewriteStylexClassNamesInCssSelectors(
+  source: string,
+  classNamePrefix: string,
+  classNames: Map<string, string>,
+): StylexRewriteResult {
+  const edits = cssSelectorFragments(source).flatMap((fragment) =>
+    rewriteStylexClassNames(fragment.source, classNamePrefix, classNames).edits.map(
+      (edit) => ({
+        ...edit,
+        end: fragment.start + edit.end,
+        start: fragment.start + edit.start,
+      }),
+    ),
+  );
+
+  return {
+    changed: edits.length > 0,
+    code: applyStylexClassNameEdits(source, edits),
+    edits,
+  };
+}
+
+const htmlElementPattern =
+  /<!--[\s\S]*?-->|<(script|style|textarea|title)\b[^>]*>[\s\S]*?<\/\1\s*>|<[A-Za-z][^>]*>/gi;
+const htmlClassAttributePattern =
+  /(\sclass\s*=\s*)(?:(["'])((?:(?!\2)[^\r\n])*)\2|([^\s"'`=<>]+))/gi;
+
+function inlineCssFragmentsInHtml(source: string): SourceFragment[] {
+  const fragments: SourceFragment[] = [];
+
+  for (const match of source.matchAll(htmlElementPattern)) {
+    if (match[1]?.toLowerCase() !== "style") {
+      continue;
+    }
+
+    const element = match[0];
+    const openingTagEnd = element.indexOf(">");
+    const closingTagStart = element.toLowerCase().lastIndexOf("</style");
+
+    if (openingTagEnd < 0 || closingTagStart < openingTagEnd) {
+      continue;
+    }
+
+    fragments.push({
+      source: element.slice(openingTagEnd + 1, closingTagStart),
+      start: match.index + openingTagEnd + 1,
+    });
+  }
+
+  return fragments;
+}
+
+export function findInlineCssSourcesInHtml(source: string): string[] {
+  return inlineCssFragmentsInHtml(source).map((fragment) => fragment.source);
+}
+
+export function rewriteStylexClassNamesInHtml(
+  source: string,
+  classNamePrefix: string,
+  classNames: Map<string, string>,
+): StylexRewriteResult {
+  const edits: StylexClassNameEdit[] = [];
+
+  for (const elementMatch of source.matchAll(htmlElementPattern)) {
+    const element = elementMatch[0];
+
+    if (element.startsWith("<!--")) {
+      continue;
+    }
+
+    const tagEnd = element.indexOf(">");
+
+    if (tagEnd < 0) {
+      continue;
+    }
+
+    const startTag = element.slice(0, tagEnd + 1);
+
+    for (const attributeMatch of startTag.matchAll(htmlClassAttributePattern)) {
+      const value = attributeMatch[3] ?? attributeMatch[4];
+
+      if (value === undefined) {
+        continue;
+      }
+
+      const prefix = attributeMatch[1] ?? "";
+      const quote = attributeMatch[2] ?? "";
+      const valueStart =
+        elementMatch.index + attributeMatch.index + prefix.length + quote.length;
+      const rewrite = rewriteStylexClassNames(value, classNamePrefix, classNames);
+
+      edits.push(
+        ...rewrite.edits.map((edit) => ({
+          ...edit,
+          end: valueStart + edit.end,
+          start: valueStart + edit.start,
+        })),
+      );
+    }
+  }
+
+  for (const fragment of inlineCssFragmentsInHtml(source)) {
+    const rewrite = rewriteStylexClassNamesInCssSelectors(
+      fragment.source,
+      classNamePrefix,
+      classNames,
+    );
+
+    edits.push(
+      ...rewrite.edits.map((edit) => ({
+        ...edit,
+        end: fragment.start + edit.end,
+        start: fragment.start + edit.start,
+      })),
+    );
+  }
+
+  return {
+    changed: edits.length > 0,
+    code: applyStylexClassNameEdits(source, edits),
+    edits,
+  };
 }

@@ -3,10 +3,13 @@ import { posix } from "node:path";
 import type { Plugin, ResolvedConfig, Rollup } from "vite";
 import {
   findCssClassNamesInSelectors,
+  findInlineCssSourcesInHtml,
   findStylexClassNamesInCompiledObjects,
   findStylexClassNamesInRules,
   mangleStylexClassName,
   rewriteStylexClassNames,
+  rewriteStylexClassNamesInCssSelectors,
+  rewriteStylexClassNamesInHtml,
   type StylexClassNameEdit,
 } from "./class-names.js";
 import { composeWithSourceMap, rewriteWithSourceMap } from "./source-maps.js";
@@ -53,6 +56,8 @@ const htmlElementPattern =
   /<!--[\s\S]*?-->|<(script|style|textarea|title)\b[^>]*>[\s\S]*?<\/\1\s*>|<[A-Za-z][^>]*>/gi;
 const htmlUnquotedUrlAttributePattern =
   /(\s(?:action|background|cite|data|formaction|href|manifest|poster|src)\s*=\s*)([^\s"'`=<>]+)/gi;
+const htmlSrcsetAttributePattern =
+  /(\s(?:imagesrcset|srcset)\s*=\s*)(?:(["'])((?:(?!\2)[^\r\n])*)\2|([^\s"'`=<>]+))/gi;
 
 function assetSourceToString(source: string | Uint8Array): string {
   return typeof source === "string" ? source : new TextDecoder().decode(source);
@@ -77,6 +82,10 @@ function isCssAsset({ output }: TextAsset): boolean {
 
 function isJavaScriptAsset({ output }: TextAsset): boolean {
   return /\.(?:cjs|js|mjs)$/.test(output.fileName);
+}
+
+function isHtmlAsset({ output }: TextAsset): boolean {
+  return output.fileName.endsWith(".html");
 }
 
 function contentHash(source: string, hashCharacters: HashCharacters): string {
@@ -217,26 +226,117 @@ function htmlStartTags(value: string): string[] {
   return tags;
 }
 
-function fileNameReferenceTokens(
-  value: string,
-  includeHtmlAttributes = false,
-): string[] {
-  const tokens: string[] = [];
-  const quotedPattern = /(["'`])((?:\\[\s\S]|(?!\1)[^\\\r\n])*)\1/g;
+type StructuredReferenceKind = "generic" | "html" | "javascript";
 
-  for (const match of value.matchAll(quotedPattern)) {
+type TextToken = {
+  end: number;
+  start: number;
+  value: string;
+};
+
+function quotedTokens(value: string): TextToken[] {
+  const tokens: TextToken[] = [];
+  const pattern = /(["'`])((?:\\[\s\S]|(?!\1)[^\\\r\n])*)\1/g;
+
+  for (const match of value.matchAll(pattern)) {
     const token = match[2];
 
-    if (token !== undefined) {
-      tokens.push(token);
+    if (token === undefined) {
+      continue;
+    }
+
+    const start = match.index + 1;
+    tokens.push({ end: start + token.length, start, value: token });
+  }
+
+  return tokens;
+}
+
+function javascriptFileNameReferenceTokens(value: string): TextToken[] {
+  return quotedTokens(value).filter((token) => {
+    const before = value.slice(Math.max(0, token.start - 160), token.start - 1);
+    const after = value.slice(token.end + 1, token.end + 100);
+
+    return (
+      (/\bnew\s+URL\s*\(\s*$/.test(before) &&
+        /^\s*,\s*import\.meta\.url\s*\)/.test(after)) ||
+      (/\bimport\s*\(\s*$/.test(before) && /^\s*\)/.test(after)) ||
+      /\b(?:from|import)\s*$/.test(before)
+    );
+  });
+}
+
+function srcsetUrlTokens(value: string): TextToken[] {
+  const tokens: TextToken[] = [];
+  let index = 0;
+
+  while (index < value.length) {
+    while (index < value.length && /[\s,]/.test(value.charAt(index))) {
+      index += 1;
+    }
+
+    const start = index;
+
+    while (index < value.length && !/\s/.test(value.charAt(index))) {
+      index += 1;
+    }
+
+    let end = index;
+
+    while (end > start && value.charAt(end - 1) === ",") {
+      end -= 1;
+    }
+
+    const hasTrailingSeparator = end < index;
+
+    if (end > start) {
+      tokens.push({ end, start, value: value.slice(start, end) });
+    }
+
+    if (hasTrailingSeparator) {
+      continue;
+    }
+
+    let parentheses = 0;
+
+    while (index < value.length) {
+      const character = value.charAt(index);
+
+      if (character === "(") {
+        parentheses += 1;
+      } else if (character === ")" && parentheses > 0) {
+        parentheses -= 1;
+      } else if (character === "," && parentheses === 0) {
+        index += 1;
+        break;
+      }
+
+      index += 1;
     }
   }
 
-  for (const match of value.matchAll(/\burl\(\s*([^"')\s][^)]*?)\s*\)/gi)) {
-    const token = match[1];
+  return tokens;
+}
 
-    if (token !== undefined) {
-      tokens.push(token);
+function fileNameReferenceTokens(
+  value: string,
+  kind: StructuredReferenceKind,
+): string[] {
+  const tokens: string[] = [];
+
+  for (const token of kind === "javascript"
+    ? javascriptFileNameReferenceTokens(value)
+    : quotedTokens(value)) {
+    tokens.push(token.value);
+  }
+
+  if (kind !== "javascript") {
+    for (const match of value.matchAll(/\burl\(\s*([^"')\s][^)]*?)\s*\)/gi)) {
+      const token = match[1];
+
+      if (token !== undefined) {
+        tokens.push(token);
+      }
     }
   }
 
@@ -248,13 +348,21 @@ function fileNameReferenceTokens(
     }
   }
 
-  if (includeHtmlAttributes) {
+  if (kind === "html") {
     for (const tag of htmlStartTags(value)) {
       for (const match of tag.matchAll(htmlUnquotedUrlAttributePattern)) {
         const token = match[2];
 
         if (token !== undefined) {
           tokens.push(token);
+        }
+      }
+
+      for (const match of tag.matchAll(htmlSrcsetAttributePattern)) {
+        const srcset = match[3] ?? match[4];
+
+        if (srcset !== undefined) {
+          tokens.push(...srcsetUrlTokens(srcset).map((token) => token.value));
         }
       }
     }
@@ -266,22 +374,33 @@ function fileNameReferenceTokens(
 function replaceStructuredFileNameReferences(
   value: string,
   replacements: ReadonlyMap<string, string>,
-  includeHtmlAttributes = false,
+  kind: StructuredReferenceKind,
 ): string {
-  const replaceQuoted = value.replace(
-    /(["'`])((?:\\[\s\S]|(?!\1)[^\\\r\n])*)\1/g,
-    (match, quote: string, token: string) => {
-      const replacement = replaceFileNameReference(token, replacements);
-      return replacement === token ? match : `${quote}${replacement}${quote}`;
-    },
-  );
-  const replaceUrls = replaceQuoted.replace(
-    /\burl\(\s*([^"')\s][^)]*?)\s*\)/gi,
-    (match, token: string) => {
-      const replacement = replaceFileNameReference(token, replacements);
-      return replacement === token ? match : match.replace(token, replacement);
-    },
-  );
+  let replaceQuoted = value;
+
+  const quotedReferences =
+    kind === "javascript"
+      ? javascriptFileNameReferenceTokens(value)
+      : quotedTokens(value);
+
+  for (const token of quotedReferences.reverse()) {
+    const replacement = replaceFileNameReference(token.value, replacements);
+
+    if (replacement !== token.value) {
+      replaceQuoted = `${replaceQuoted.slice(0, token.start)}${replacement}${replaceQuoted.slice(token.end)}`;
+    }
+  }
+
+  const replaceUrls =
+    kind === "javascript"
+      ? replaceQuoted
+      : replaceQuoted.replace(
+          /\burl\(\s*([^"')\s][^)]*?)\s*\)/gi,
+          (match, token: string) => {
+            const replacement = replaceFileNameReference(token, replacements);
+            return replacement === token ? match : match.replace(token, replacement);
+          },
+        );
 
   const replaceDirectives = replaceUrls.replace(
     /((?:sourceMappingURL|sourceURL)=)([^\s*]+)/g,
@@ -291,7 +410,7 @@ function replaceStructuredFileNameReferences(
     },
   );
 
-  if (!includeHtmlAttributes) {
+  if (kind !== "html") {
     return replaceDirectives;
   }
 
@@ -307,11 +426,39 @@ function replaceStructuredFileNameReferences(
     }
 
     const tag = element.slice(0, tagEnd + 1);
-    const updatedTag = tag.replace(
+    const updatedUrlAttributes = tag.replace(
       htmlUnquotedUrlAttributePattern,
       (match, prefix: string, token: string) => {
         const replacement = replaceFileNameReference(token, replacements);
         return replacement === token ? match : `${prefix}${replacement}`;
+      },
+    );
+    const updatedTag = updatedUrlAttributes.replace(
+      htmlSrcsetAttributePattern,
+      (match, prefix: string, quote: string | undefined, quoted: string | undefined, unquoted: string | undefined) => {
+        const srcset = quoted ?? unquoted;
+
+        if (srcset === undefined) {
+          return match;
+        }
+
+        let updatedSrcset = srcset;
+
+        for (const token of srcsetUrlTokens(srcset).reverse()) {
+          const replacement = replaceFileNameReference(token.value, replacements);
+
+          if (replacement !== token.value) {
+            updatedSrcset = `${updatedSrcset.slice(0, token.start)}${replacement}${updatedSrcset.slice(token.end)}`;
+          }
+        }
+
+        if (updatedSrcset === srcset) {
+          return match;
+        }
+
+        return quote === undefined
+          ? `${prefix}${updatedSrcset}`
+          : `${prefix}${quote}${updatedSrcset}${quote}`;
       },
     );
 
@@ -538,6 +685,19 @@ function textValue(output: OutputFile): string | null {
   return typeof output.source === "string" ? output.source : null;
 }
 
+function structuredReferenceKind(output: OutputFile): StructuredReferenceKind {
+  if (
+    output.type === "chunk" ||
+    (output.type === "asset" && /\.(?:cjs|js|mjs)$/.test(output.fileName))
+  ) {
+    return "javascript";
+  }
+
+  return output.type === "asset" && output.fileName.endsWith(".html")
+    ? "html"
+    : "generic";
+}
+
 function markersInFileName(
   fileName: string,
   markers: ReadonlyMap<string, HashMarker>,
@@ -631,7 +791,7 @@ function normalizeFileNameReferences(
       : replaceStructuredFileNameReferences(
           value,
           replacements,
-          output.type === "asset" && output.fileName.endsWith(".html"),
+          structuredReferenceKind(output),
         );
 
   return replaceInlineSourceMapFileNameReferences(updatedValue, replacements);
@@ -675,7 +835,7 @@ function outputDependencies(
 
       for (const token of fileNameReferenceTokens(
         textValue(output) ?? "",
-        output.type === "asset" && output.fileName.endsWith(".html"),
+        structuredReferenceKind(output),
       )) {
         for (const sentinel of token.match(hashMarkerSentinelPattern) ?? []) {
           const markerOutputs = outputsBySentinel.get(sentinel);
@@ -986,6 +1146,7 @@ function updateOutputFileNameReferences(
       const updatedCode = replaceStructuredFileNameReferences(
         output.code,
         replacements,
+        "javascript",
       );
       output.code = replaceInlineSourceMapFileNameReferences(
         updatedCode,
@@ -1039,7 +1200,7 @@ function updateOutputFileNameReferences(
         : replaceStructuredFileNameReferences(
             output.source,
             replacements,
-            output.fileName.endsWith(".html"),
+            structuredReferenceKind(output),
           );
       output.source = replaceInlineSourceMapFileNameReferences(
         updatedSource,
@@ -1452,6 +1613,9 @@ export default function stylexMangleClassNames(
 
         const assets = textAssets(bundle);
         const cssSources = assets.filter(isCssAsset).map(({ source }) => source);
+        const inlineCssSources = assets
+          .filter(isHtmlAsset)
+          .flatMap(({ source }) => findInlineCssSourcesInHtml(source));
         const hasExtractedClasses = [...pendingCompiledClassNames].some(
           (className) => !pendingRuntimeClassNames.has(className),
         );
@@ -1462,10 +1626,18 @@ export default function stylexMangleClassNames(
           );
         }
 
-        assertNoAuthoredCssCollisions(this, cssSources);
+        assertNoAuthoredCssCollisions(this, [...cssSources, ...inlineCssSources]);
 
         for (const { output, source } of assets) {
-          const result = rewriteStylexClassNames(source, classNamePrefix, classNames);
+          const result = isCssAsset({ output, source })
+            ? rewriteStylexClassNamesInCssSelectors(
+                source,
+                classNamePrefix,
+                classNames,
+              )
+            : isHtmlAsset({ output, source })
+              ? rewriteStylexClassNamesInHtml(source, classNamePrefix, classNames)
+              : rewriteStylexClassNames(source, classNamePrefix, classNames);
 
           if (result.changed) {
             if (isCssAsset({ output, source })) {

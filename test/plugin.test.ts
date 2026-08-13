@@ -519,12 +519,14 @@ describe("stylexMangleClassNames", () => {
       assetFileNames: "assets/[name]-[hash][extname]",
     });
 
-    if (typeof resolved.assetFileNames !== "function") {
+    const assetFileNames = resolved.assetFileNames;
+
+    if (typeof assetFileNames !== "function") {
       throw new Error("Expected an asset filename callback");
     }
 
     const preliminaryCssFileName = materializeHashPlaceholders(
-      resolved.assetFileNames({
+      assetFileNames({
         name: "stylex.css",
         source: `.${PREFIX}1{color:red}`,
         type: "asset",
@@ -617,6 +619,53 @@ describe("stylexMangleClassNames", () => {
     expect(css.fileName).not.toBe(preliminaryCssFileName);
     expect(html.source).toBe(
       `<link rel="stylesheet" href="${css.fileName}">`,
+    );
+  });
+
+  test("updates each finalized filename in an HTML srcset attribute", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const resolved = outputOptionsResult(plugin, {
+      assetFileNames: "assets/[name]-[hash][extname]",
+    });
+
+    const assetFileNames = resolved.assetFileNames;
+
+    if (typeof assetFileNames !== "function") {
+      throw new Error("Expected an asset filename callback");
+    }
+
+    const preliminaryImageFileName = (name: string, hash: string): string => {
+      return materializeHashPlaceholders(
+        assetFileNames({
+          name: `${name}.png`,
+          source: name,
+          type: "asset",
+        } as Rollup.PreRenderedAsset),
+        hash,
+      )
+        .replace("[name]", name)
+        .replace("[extname]", ".png");
+    };
+
+    const firstFileName = preliminaryImageFileName("first", "first000");
+    const secondFileName = preliminaryImageFileName("second", "second00");
+    const first = outputAsset(firstFileName, "first");
+    const second = outputAsset(secondFileName, "second");
+    const html = outputAsset(
+      "index.html",
+      `<img srcset="${firstFileName} 1x, ${secondFileName} 2x">`,
+    );
+
+    runGenerateBundle(plugin, {
+      [first.fileName]: first,
+      [html.fileName]: html,
+      [second.fileName]: second,
+    });
+
+    expect(first.fileName).not.toBe(firstFileName);
+    expect(second.fileName).not.toBe(secondFileName);
+    expect(html.source).toBe(
+      `<img srcset="${first.fileName} 1x, ${second.fileName} 2x">`,
     );
   });
 
@@ -1349,6 +1398,29 @@ describe("stylexMangleClassNames", () => {
     expect(css.source).toBe(`.${PREFIX}123{color:red}`);
   });
 
+  test("rewrites generated classes only in CSS selectors and HTML class attributes", () => {
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    );
+    const css = outputAsset(
+      "styles.css",
+      `.${PREFIX}1{background:url('/${PREFIX}1.png')}`,
+    );
+    const html = outputAsset(
+      "index.html",
+      `<div class="${PREFIX}1"><p>${PREFIX}1</p></div>`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [css.fileName]: css,
+      [html.fileName]: html,
+      [javascript.fileName]: javascript,
+    });
+
+    expect(css.source).toBe(`.a{background:url('/${PREFIX}1.png')}`);
+    expect(html.source).toBe(`<div class="a"><p>${PREFIX}1</p></div>`);
+  });
+
   test("preserves prefix-shaped application data without a matching CSS selector", () => {
     const javascript = outputChunk(`globalThis.productId = "${PREFIX}123";`);
 
@@ -1395,6 +1467,37 @@ describe("stylexMangleClassNames", () => {
       runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
         [javascript.fileName]: javascript,
         [css.fileName]: css,
+      }),
+    ).toThrow('generated class ".a" would collide with authored CSS');
+  });
+
+  test("detects an authored class collision in an @scope prelude", () => {
+    const javascript = outputChunk(`inject({ ltr: ".${PREFIX}1{color:red}" });`);
+    const css = outputAsset(
+      "styles.css",
+      `.${PREFIX}1{color:red}@scope (.a) {.child{color:blue}}`,
+    );
+
+    expect(() =>
+      runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+        [javascript.fileName]: javascript,
+        [css.fileName]: css,
+      }),
+    ).toThrow('generated class ".a" would collide with authored CSS');
+  });
+
+  test("detects an authored class collision in an inline HTML style", () => {
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    );
+    const css = outputAsset("styles.css", `.${PREFIX}1{color:red}`);
+    const html = outputAsset("index.html", "<style>.a{color:blue}</style>");
+
+    expect(() =>
+      runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+        [css.fileName]: css,
+        [html.fileName]: html,
+        [javascript.fileName]: javascript,
       }),
     ).toThrow('generated class ".a" would collide with authored CSS');
   });

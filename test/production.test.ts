@@ -492,9 +492,9 @@ async function buildWithAuthoredPreliminaryFileNameText(): Promise<{
             throw new Error("Expected a JavaScript chunk");
           }
 
-          javascript.code += `\nglobalThis.copy = ${JSON.stringify(
+          javascript.code += `\nglobalThis.prefixedCopy = ${JSON.stringify(
             `application-copy: ${preliminaryCssFileName}`,
-          )};`;
+          )};\nglobalThis.exactCopy = ${JSON.stringify(preliminaryCssFileName)};`;
         },
       },
       stylexMangleClassNames({ classNamePrefix: PREFIX }),
@@ -1030,7 +1030,7 @@ describe("production output", () => {
     expect(cssFile).not.toContain("_S");
   });
 
-  test("preserves authored text containing a preliminary output filename", async () => {
+  test("preserves authored strings containing a preliminary output filename", async () => {
     const output = await buildWithAuthoredPreliminaryFileNameText();
 
     expect(output.preliminaryCssFileName).toContain("__STYLEX_HASH_");
@@ -1039,6 +1039,12 @@ describe("production output", () => {
       `application-copy: ${output.preliminaryCssFileName}`,
     );
     expect(output.javascript).not.toContain(`application-copy: ${output.cssFileName}`);
+    expect(output.javascript).toContain(
+      `globalThis.exactCopy = ${JSON.stringify(output.preliminaryCssFileName)};`,
+    );
+    expect(output.javascript).not.toContain(
+      `globalThis.exactCopy = ${JSON.stringify(output.cssFileName)};`,
+    );
   });
 
   test("does not reserve class names from tree-shaken runtime rules", async () => {
