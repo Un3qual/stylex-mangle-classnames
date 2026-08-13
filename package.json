@@ -66,6 +66,7 @@
   "dependencies": {
     "@ampproject/remapping": "^2.3.0",
     "magic-string": "^1.1.1",
-    "postcss": "^8.5.26"
+    "postcss": "^8.5.26",
+    "postcss-selector-parser": "7.1.4"
   }
 }

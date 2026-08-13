@@ -1604,6 +1604,23 @@ describe("stylexMangleClassNames", () => {
     expect(html.source).toBe(`<div class="a"><p>${PREFIX}1</p></div>`);
   });
 
+  test("rewrites parsed class attribute selectors", () => {
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    );
+    const css = outputAsset(
+      "styles.css",
+      `.${PREFIX}1{color:red}[cl\\61 ss~="${PREFIX}1"]{color:blue}`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [css.fileName]: css,
+      [javascript.fileName]: javascript,
+    });
+
+    expect(css.source).toBe(`.a{color:red}[cl\\61 ss~="a"]{color:blue}`);
+  });
+
   test("rewrites HTML class attributes after greater-than signs in quoted values", () => {
     const javascript = outputChunk(
       `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
@@ -1735,6 +1752,21 @@ describe("stylexMangleClassNames", () => {
     const css = outputAsset(
       "styles.css",
       `.${PREFIX}1{color:red}[class~="a"]{color:blue}`,
+    );
+
+    expect(() =>
+      runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+        [javascript.fileName]: javascript,
+        [css.fileName]: css,
+      }),
+    ).toThrow('generated class ".a" would collide with authored CSS');
+  });
+
+  test("detects a collision through an escaped class attribute name", () => {
+    const javascript = outputChunk(`inject({ ltr: ".${PREFIX}1{color:red}" });`);
+    const css = outputAsset(
+      "styles.css",
+      `.${PREFIX}1{color:red}[cl\\61 ss~="a"]{color:blue}`,
     );
 
     expect(() =>

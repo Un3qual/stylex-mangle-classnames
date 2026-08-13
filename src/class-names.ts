@@ -1,4 +1,5 @@
 import postcss from "postcss";
+import selectorParser from "postcss-selector-parser";
 import { findHtmlAttributes, findHtmlStartTags } from "./html.js";
 
 const SHORT_CLASS_NAME_ALPHABET = "abcdefghijklmnopqrstuvwxyz";
@@ -34,156 +35,66 @@ function atomicClassPattern(classNamePrefix: string): RegExp {
   );
 }
 
-function atomicClassSelectorPattern(classNamePrefix: string): RegExp {
-  const prefix = escapeRegularExpression(classNamePrefix);
-
-  return new RegExp(`\\.(${prefix}(?:0|[1-9a-z][0-9a-z]*))(?![${CSS_IDENTIFIER_CHARACTER}])`, "gu");
-}
-
-const cssEscapePattern = String.raw`\\(?:[0-9A-Fa-f]{1,6}[ \t\r\n\f]?|[^\r\n\f])`;
-const cssIdentifierStartPattern =
-  String.raw`(?:[_A-Za-z\u0080-\uFFFF]|${cssEscapePattern}|-(?:[_A-Za-z\u0080-\uFFFF-]|${cssEscapePattern}))`;
-const cssIdentifierRestPattern =
-  String.raw`(?:[_A-Za-z0-9\u0080-\uFFFF-]|${cssEscapePattern})*`;
-const classSelectorPattern = new RegExp(
-  String.raw`\.(${cssIdentifierStartPattern}${cssIdentifierRestPattern})`,
-  "g",
-);
-const classAttributeSelectorPattern = new RegExp(
-  String.raw`\[\s*class\s*([~|^$*]?=)\s*(?:"((?:${cssEscapePattern}|[^"\\])*)"|'((?:${cssEscapePattern}|[^'\\])*)'|(${cssIdentifierStartPattern}${cssIdentifierRestPattern}))\s*([iIsS])?\s*\]`,
-  "gi",
-);
-
 const stylexRulePattern = /\b(?:ltr|rtl)\s*:\s*(?:`([^`]*)`|"((?:\\.|[^"\\])*)")/g;
 
-function selectorClassText(selector: string): string {
-  let bracketDepth = 0;
-  let comment = false;
-  let escaped = false;
-  let quote: '"' | "'" | null = null;
-  let result = "";
-
-  for (let index = 0; index < selector.length; index += 1) {
-    const character = selector.charAt(index);
-    const nextCharacter = selector[index + 1];
-
-    if (comment) {
-      result += " ";
-
-      if (character === "*" && nextCharacter === "/") {
-        comment = false;
-        result += " ";
-        index += 1;
-      }
-
-      continue;
-    }
-
-    if (quote !== null) {
-      result += " ";
-
-      if (escaped) {
-        escaped = false;
-      } else if (character === "\\") {
-        escaped = true;
-      } else if (character === quote) {
-        quote = null;
-      }
-
-      continue;
-    }
-
-    if (character === "/" && nextCharacter === "*") {
-      comment = true;
-      result += "  ";
-      index += 1;
-    } else if (character === '"' || character === "'") {
-      quote = character;
-      result += " ";
-    } else if (character === "[") {
-      bracketDepth += 1;
-      result += " ";
-    } else if (character === "]" && bracketDepth > 0) {
-      bracketDepth -= 1;
-      result += " ";
-    } else if (bracketDepth === 0) {
-      result += character;
-    } else {
-      result += " ";
-    }
-  }
-
-  return result;
-}
-
-function decodeCssIdentifier(identifier: string): string {
-  return identifier.replace(
-    /\\([0-9A-Fa-f]{1,6}[ \t\r\n\f]?|[^\r\n\f])/g,
-    (_escape, escaped: string) => {
-      if (!/^[0-9A-Fa-f]/.test(escaped)) {
-        return escaped;
-      }
-
-      const codePoint = Number.parseInt(escaped.trim(), 16);
-
-      if (
-        codePoint === 0 ||
-        codePoint > 0x10ffff ||
-        (codePoint >= 0xd800 && codePoint <= 0xdfff)
-      ) {
-        return "\uFFFD";
-      }
-
-      return String.fromCodePoint(codePoint);
-    },
-  );
-}
-
-type SelectorClassToken = {
-  decoded: string;
+type SelectorClassReference = {
+  classNames: string[];
   end: number;
+  replacement: (classNames: Map<string, string>) => string | null;
   start: number;
 };
 
-function selectorClassTokens(selector: string): SelectorClassToken[] {
-  const tokens: SelectorClassToken[] = [];
+function selectorClassReferences(selector: string): SelectorClassReference[] {
+  const references: SelectorClassReference[] = [];
+  const ast = selectorParser().astSync(selector);
 
-  for (const match of selectorClassText(selector).matchAll(classSelectorPattern)) {
-    const identifier = match[1];
-
-    if (identifier === undefined) {
-      continue;
-    }
-
-    const start = match.index + 1;
-    tokens.push({
-      decoded: decodeCssIdentifier(identifier),
-      end: start + identifier.length,
-      start,
+  ast.walkClasses((node) => {
+    const rendered = node.toString();
+    references.push({
+      classNames: [node.value],
+      end: node.sourceIndex + rendered.length - node.rawSpaceAfter.length,
+      replacement: (classNames) => classNames.get(node.value) ?? null,
+      start: node.sourceIndex + 1,
     });
-  }
+  });
 
-  for (const match of selector.matchAll(classAttributeSelectorPattern)) {
-    const value = match[2] ?? match[3] ?? match[4];
-
-    if (value === undefined) {
-      continue;
+  ast.walkAttributes((node) => {
+    if (
+      node.attribute.toLowerCase() !== "class" ||
+      node.operator === undefined ||
+      node.value === undefined
+    ) {
+      return;
     }
 
-    const valueStart = match.index + match[0].indexOf(value);
+    const normalize = node.insensitive
+      ? (className: string) => className.toLowerCase()
+      : (className: string) => className;
+    const classNames = [...node.value.matchAll(/\S+/g)].map((match) =>
+      normalize(match[0]),
+    );
 
-    for (const token of value.matchAll(/\S+/g)) {
-      const raw = token[0];
-      const decoded = decodeCssIdentifier(raw);
-      tokens.push({
-        decoded: match[5]?.toLowerCase() === "i" ? decoded.toLowerCase() : decoded,
-        end: valueStart + token.index + raw.length,
-        start: valueStart + token.index,
-      });
-    }
-  }
+    references.push({
+      classNames,
+      end: node.sourceIndex + node.toString().length,
+      replacement: (replacements) => {
+        const value = node.value?.replace(/\S+/g, (className) =>
+          replacements.get(normalize(className)) ?? className,
+        );
 
-  return tokens;
+        if (value === undefined || value === node.value) {
+          return null;
+        }
+
+        const replacement = node.clone();
+        replacement.setValue(value, { quoteMark: node.quoteMark });
+        return replacement.toString();
+      },
+      start: node.sourceIndex,
+    });
+  });
+
+  return references;
 }
 
 function isStylexConstKey(source: string, classNameOffset: number): boolean {
@@ -212,18 +123,19 @@ function shortStylexClassName(index: number): string {
   return result;
 }
 
+function isStylexClassName(className: string, classNamePrefix: string): boolean {
+  return (
+    className.startsWith(classNamePrefix) &&
+    /^(?:0|[1-9a-z][0-9a-z]*)$/.test(className.slice(classNamePrefix.length))
+  );
+}
+
 export function mangleStylexClassName(
   className: string,
   classNamePrefix: string,
   classNames: Map<string, string>,
 ): string | null {
-  if (!className.startsWith(classNamePrefix)) {
-    return null;
-  }
-
-  const hash = className.slice(classNamePrefix.length);
-
-  if (!/^(?:0|[1-9a-z][0-9a-z]*)$/.test(hash)) {
+  if (!isStylexClassName(className, classNamePrefix)) {
     return null;
   }
 
@@ -239,6 +151,62 @@ export function mangleStylexClassName(
 }
 
 const selectorAtRuleNames = new Set(["custom-selector", "nest", "scope"]);
+
+function scopeSelectorFragments(source: string, start: number): SourceFragment[] {
+  const fragments: SourceFragment[] = [];
+  let comment = false;
+  let depth = 0;
+  let escaped = false;
+  let fragmentStart = 0;
+  let quote: '"' | "'" | null = null;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source.charAt(index);
+
+    if (comment) {
+      if (character === "*" && source[index + 1] === "/") {
+        comment = false;
+        index += 1;
+      }
+      continue;
+    }
+
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (character === "/" && source[index + 1] === "*") {
+      comment = true;
+      index += 1;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === "\\") {
+      index += 1;
+    } else if (character === "(") {
+      if (depth === 0) {
+        fragmentStart = index + 1;
+      }
+      depth += 1;
+    } else if (character === ")" && depth > 0) {
+      depth -= 1;
+      if (depth === 0) {
+        fragments.push({
+          source: source.slice(fragmentStart, index),
+          start: start + fragmentStart,
+        });
+      }
+    }
+  }
+
+  return fragments;
+}
 
 function cssSelectorFragments(source: string): SourceFragment[] {
   const fragments: SourceFragment[] = [];
@@ -268,45 +236,31 @@ function cssSelectorFragments(source: string): SourceFragment[] {
       return;
     }
 
-    fragments.push({
-      source: atRule.raws.params?.raw ?? atRule.params,
-      start:
-        nodeStart +
-        1 +
-        atRule.name.length +
-        (atRule.raws.afterName ?? "").length,
-    });
+    const params = atRule.raws.params?.raw ?? atRule.params;
+    const start =
+      nodeStart +
+      1 +
+      atRule.name.length +
+      (atRule.raws.afterName ?? "").length;
+
+    if (atRule.name.toLowerCase() === "scope") {
+      fragments.push(...scopeSelectorFragments(params, start));
+    } else {
+      fragments.push({ source: params, start });
+    }
   });
 
   return fragments;
-}
-
-function findClassNamesInSelectors(
-  source: string,
-  pattern: RegExp,
-  normalize: (className: string) => string = (className) => className,
-): Set<string> {
-  const classNames = new Set<string>();
-
-  for (const fragment of cssSelectorFragments(source)) {
-    for (const match of selectorClassText(fragment.source).matchAll(pattern)) {
-      const className = match[1];
-
-      if (className !== undefined) {
-        classNames.add(normalize(className));
-      }
-    }
-  }
-
-  return classNames;
 }
 
 export function findCssClassNamesInSelectors(source: string): Set<string> {
   const classNames = new Set<string>();
 
   for (const fragment of cssSelectorFragments(source)) {
-    for (const token of selectorClassTokens(fragment.source)) {
-      classNames.add(token.decoded);
+    for (const reference of selectorClassReferences(fragment.source)) {
+      for (const className of reference.classNames) {
+        classNames.add(className);
+      }
     }
   }
 
@@ -317,7 +271,11 @@ export function findStylexClassNamesInSelectors(
   source: string,
   classNamePrefix: string,
 ): Set<string> {
-  return findClassNamesInSelectors(source, atomicClassSelectorPattern(classNamePrefix));
+  return new Set(
+    [...findCssClassNamesInSelectors(source)].filter((className) =>
+      isStylexClassName(className, classNamePrefix),
+    ),
+  );
 }
 
 export function findStylexClassNameReferences(
@@ -508,16 +466,16 @@ export function rewriteStylexClassNamesInCssSelectors(
   classNames: Map<string, string>,
 ): StylexRewriteResult {
   const edits = cssSelectorFragments(source).flatMap((fragment) =>
-    selectorClassTokens(fragment.source).flatMap((token) => {
-      const replacement = classNames.get(token.decoded);
+    selectorClassReferences(fragment.source).flatMap((reference) => {
+      const replacement = reference.replacement(classNames);
 
-      return replacement === undefined
+      return replacement === null
         ? []
         : [
             {
-              end: fragment.start + token.end,
+              end: fragment.start + reference.end,
               replacement,
-              start: fragment.start + token.start,
+              start: fragment.start + reference.start,
             },
           ];
     }),
