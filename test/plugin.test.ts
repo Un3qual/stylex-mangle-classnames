@@ -178,7 +178,7 @@ async function runTransform(plugin: Plugin, code: string) {
   );
 }
 
-async function runTransformForModule(
+function runTransformForModule(
   plugin: Plugin,
   code: string,
   id: string,
@@ -191,11 +191,13 @@ async function runTransformForModule(
   }
 
   const handler = typeof hook === "function" ? hook : hook.handler;
-  return handler.call(
-    { parse: parseAst } as unknown as Rollup.TransformPluginContext,
-    code,
-    id,
-    (moduleType === undefined ? {} : { moduleType }) as never,
+  return Promise.resolve(
+    handler.call(
+      { parse: parseAst } as unknown as Rollup.TransformPluginContext,
+      code,
+      id,
+      (moduleType === undefined ? {} : { moduleType }) as never,
+    ),
   );
 }
 

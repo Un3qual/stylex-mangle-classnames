@@ -376,6 +376,16 @@ async function buildHashedMain(includeExtraEntry: boolean): Promise<{
 }
 
 describe("production output", () => {
+  function lastLineLength(lines: readonly string[]): number {
+    const line = lines.at(-1);
+
+    if (line === undefined) {
+      throw new Error("Expected at least one generated source line");
+    }
+
+    return line.length;
+  }
+
   test("does not remangle short names during output writing", async () => {
     const javascript = await buildWithPrefixClasses();
     const expected = [
@@ -433,7 +443,7 @@ describe("production output", () => {
       const generatedPrefix = output.javascript.slice(0, generatedIndex).split("\n");
       const originalPosition = new SourceMapConsumer(output.sourceMap as unknown as RawSourceMap)
         .originalPositionFor({
-          column: generatedPrefix.at(-1)!.length,
+          column: lastLineLength(generatedPrefix),
           line: generatedPrefix.length,
         });
 
@@ -456,7 +466,7 @@ describe("production output", () => {
     const generatedPrefix = output.javascript.slice(0, generatedIndex).split("\n");
     const originalPosition = new SourceMapConsumer(output.sourceMap as unknown as RawSourceMap)
       .originalPositionFor({
-        column: generatedPrefix.at(-1)!.length,
+        column: lastLineLength(generatedPrefix),
         line: generatedPrefix.length,
       });
 
@@ -480,7 +490,7 @@ describe("production output", () => {
     const generatedPrefix = output.javascript.slice(0, generatedIndex).split("\n");
     const originalPosition = new SourceMapConsumer(output.sourceMap as unknown as RawSourceMap)
       .originalPositionFor({
-        column: generatedPrefix.at(-1)!.length,
+        column: lastLineLength(generatedPrefix),
         line: generatedPrefix.length,
       });
 

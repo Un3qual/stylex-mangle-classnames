@@ -51,7 +51,7 @@ function assertValidPrefix(classNamePrefix: string): void {
   }
 }
 
-function isJavaScriptModule(id: string, moduleType: string | undefined): boolean {
+function isJavaScriptModule(id: string, moduleType?: string): boolean {
   if (moduleType !== undefined) {
     return moduleType === "js";
   }
@@ -149,7 +149,7 @@ export default function stylexMangleClassNames(
       if (
         command !== "build" ||
         moduleInfo.code === null ||
-        !isJavaScriptModule(moduleInfo.id, undefined)
+        !isJavaScriptModule(moduleInfo.id)
       ) {
         return;
       }

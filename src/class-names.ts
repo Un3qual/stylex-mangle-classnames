@@ -46,7 +46,7 @@ function selectorClassText(selector: string): string {
   let result = "";
 
   for (let index = 0; index < selector.length; index += 1) {
-    const character = selector[index]!;
+    const character = selector.charAt(index);
     const nextCharacter = selector[index + 1];
 
     if (comment) {
@@ -108,7 +108,9 @@ function shortStylexClassName(index: number): string {
   let result = "";
 
   do {
-    result = SHORT_CLASS_NAME_ALPHABET[remainder % SHORT_CLASS_NAME_ALPHABET.length]! + result;
+    result = SHORT_CLASS_NAME_ALPHABET.charAt(
+      remainder % SHORT_CLASS_NAME_ALPHABET.length,
+    ) + result;
     remainder = Math.floor(remainder / SHORT_CLASS_NAME_ALPHABET.length) - 1;
   } while (remainder >= 0);
 
@@ -147,7 +149,11 @@ function findClassNamesInSelectors(source: string, pattern: RegExp): Set<string>
   postcss.parse(source).walkRules((rule) => {
     for (const selector of rule.selectors) {
       for (const match of selectorClassText(selector).matchAll(pattern)) {
-        classNames.add(match[1]!);
+        const className = match[1];
+
+        if (className !== undefined) {
+          classNames.add(className);
+        }
       }
     }
   });
@@ -173,10 +179,17 @@ export function findStylexClassNameReferences(
   const classNames = new Set<string>();
 
   for (const match of source.matchAll(atomicClassPattern(classNamePrefix))) {
-    const classNameOffset = match.index + match[1]!.length;
+    const boundary = match[1];
+    const className = match[2];
+
+    if (boundary === undefined || className === undefined) {
+      continue;
+    }
+
+    const classNameOffset = match.index + boundary.length;
 
     if (!isStylexConstKey(source, classNameOffset)) {
-      classNames.add(match[2]!);
+      classNames.add(className);
     }
   }
 
