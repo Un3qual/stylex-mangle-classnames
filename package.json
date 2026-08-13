@@ -46,6 +46,7 @@
   "devDependencies": {
     "@changesets/cli": "^3.0.0",
     "@types/node": "^26.2.0",
+    "source-map-js": "^1.2.1",
     "typescript": "7.0.2",
     "vite": "8.2.1",
     "vitest": "4.1.10"
@@ -61,5 +62,9 @@
     "class-names",
     "minify",
     "mangle"
-  ]
+  ],
+  "dependencies": {
+    "@ampproject/remapping": "^2.3.0",
+    "magic-string": "^1.1.1"
+  }
 }

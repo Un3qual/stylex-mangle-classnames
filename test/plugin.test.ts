@@ -250,11 +250,9 @@ describe("stylexMangleClassNames", () => {
     await expect(runTransform(plugin, `globalThis.className = "${PREFIX}1";`)).resolves.toBeNull();
   });
 
-  test("fails closed when production source maps would become stale", async () => {
+  test("accepts production source maps", async () => {
     const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
 
-    await expect(runConfigResolved(plugin, "build", true)).rejects.toThrow(
-      "production source maps are not supported",
-    );
+    await expect(runConfigResolved(plugin, "build", true)).resolves.toBeUndefined();
   });
 });

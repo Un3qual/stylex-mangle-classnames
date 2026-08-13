@@ -8,6 +8,7 @@ import {
   mangleStylexClassName,
   rewriteStylexClassNames,
 } from "./class-names.js";
+import { rewriteWithSourceMap } from "./source-maps.js";
 
 export type StylexMangleClassNamesOptions = {
   /** Must exactly match the classNamePrefix passed to the StyleX compiler. */
@@ -51,6 +52,31 @@ function authoredCssClasses(source: string): Set<string> {
 
 function collisionMessage(className: string, original: string): string {
   return `StyleX mangling generated class ".${className}" would collide with authored CSS (source class: ".${original}").`;
+}
+
+function updateSourceMapOutput(
+  bundle: Rollup.OutputBundle,
+  output: Rollup.OutputChunk,
+  map: Rollup.SourceMap,
+): void {
+  output.map = map;
+
+  if (output.sourcemapFileName) {
+    const mapAsset = bundle[output.sourcemapFileName];
+
+    if (mapAsset?.type === "asset") {
+      mapAsset.source = map.toString();
+    }
+
+    return;
+  }
+
+  const inlineMapPattern =
+    /sourceMappingURL=data:application\/json;charset=utf-8;base64,[A-Za-z0-9+/=]+/;
+
+  if (inlineMapPattern.test(output.code)) {
+    output.code = output.code.replace(inlineMapPattern, `sourceMappingURL=${map.toUrl()}`);
+  }
 }
 
 function assertValidPrefix(classNamePrefix: string): void {
@@ -192,7 +218,18 @@ export default function stylexMangleClassNames(
       }
 
       if (output.type === "chunk") {
-        output.code = result.code;
+        if (output.map) {
+          const rewritten = rewriteWithSourceMap(
+            source,
+            output.fileName,
+            result.edits,
+            output.map,
+          );
+          output.code = rewritten.code;
+          updateSourceMapOutput(bundle, output, rewritten.map);
+        } else {
+          output.code = result.code;
+        }
       } else {
         output.source = result.code;
       }
@@ -245,12 +282,6 @@ export default function stylexMangleClassNames(
     name: "stylex-mangle-classnames",
     enforce: "post",
     configResolved(config) {
-      if (config.command === "build" && config.build.sourcemap) {
-        throw new Error(
-          "stylex-mangle-classnames: production source maps are not supported because this version rewrites output after Vite generates mappings",
-        );
-      }
-
       command = config.command;
     },
     transform(code) {

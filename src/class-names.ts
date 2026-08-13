@@ -4,6 +4,13 @@ const CSS_IDENTIFIER_CHARACTER = "A-Za-z0-9_-";
 export type StylexRewriteResult = {
   changed: boolean;
   code: string;
+  edits: StylexClassNameEdit[];
+};
+
+export type StylexClassNameEdit = {
+  end: number;
+  replacement: string;
+  start: number;
 };
 
 function escapeRegularExpression(value: string): string {
@@ -135,10 +142,11 @@ export function rewriteStylexClassNames(
   classNames: Map<string, string>,
 ): StylexRewriteResult {
   if (classNames.size === 0) {
-    return { changed: false, code: source };
+    return { changed: false, code: source, edits: [] };
   }
 
   let changed = false;
+  const edits: StylexClassNameEdit[] = [];
   const code = source.replace(
     atomicClassPattern(classNamePrefix),
     (match, boundary: string, className: string, offset: number) => {
@@ -155,9 +163,14 @@ export function rewriteStylexClassNames(
       }
 
       changed = true;
+      edits.push({
+        end: classNameOffset + className.length,
+        replacement: mangled,
+        start: classNameOffset,
+      });
       return `${boundary}${mangled}`;
     },
   );
 
-  return { changed, code };
+  return { changed, code, edits };
 }
