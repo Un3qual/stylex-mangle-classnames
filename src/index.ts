@@ -48,6 +48,10 @@ const sourceMapDirectivePattern = /\/\*[#@]\s*sourceMappingURL=([^\s*]+)\s*\*\/\
 const javascriptSourceMapDirectivePattern =
   /\/\/[#@]\s*sourceMappingURL=([^\s]+)\s*$/;
 const hashMarkerSentinelPattern = /__STYLEX_HASH_[0-9a-z]+_[0-9a-z]+__/g;
+const htmlElementPattern =
+  /<!--[\s\S]*?-->|<(script|style|textarea|title)\b[^>]*>[\s\S]*?<\/\1\s*>|<[A-Za-z][^>]*>/gi;
+const htmlUnquotedUrlAttributePattern =
+  /(\s(?:action|background|cite|data|formaction|href|manifest|poster|src)\s*=\s*)([^\s"'`=<>]+)/gi;
 
 function assetSourceToString(source: string | Uint8Array): string {
   return typeof source === "string" ? source : new TextDecoder().decode(source);
@@ -190,7 +194,30 @@ function replaceFileNameReference(
   return value;
 }
 
-function fileNameReferenceTokens(value: string): string[] {
+function htmlStartTags(value: string): string[] {
+  const tags: string[] = [];
+
+  for (const match of value.matchAll(htmlElementPattern)) {
+    const element = match[0];
+
+    if (element.startsWith("<!--")) {
+      continue;
+    }
+
+    const tagEnd = element.indexOf(">");
+
+    if (tagEnd >= 0) {
+      tags.push(element.slice(0, tagEnd + 1));
+    }
+  }
+
+  return tags;
+}
+
+function fileNameReferenceTokens(
+  value: string,
+  includeHtmlAttributes = false,
+): string[] {
   const tokens: string[] = [];
   const quotedPattern = /(["'`])([^"'`\r\n]*)\1/g;
 
@@ -218,12 +245,25 @@ function fileNameReferenceTokens(value: string): string[] {
     }
   }
 
+  if (includeHtmlAttributes) {
+    for (const tag of htmlStartTags(value)) {
+      for (const match of tag.matchAll(htmlUnquotedUrlAttributePattern)) {
+        const token = match[2];
+
+        if (token !== undefined) {
+          tokens.push(token);
+        }
+      }
+    }
+  }
+
   return tokens;
 }
 
 function replaceStructuredFileNameReferences(
   value: string,
   replacements: ReadonlyMap<string, string>,
+  includeHtmlAttributes = false,
 ): string {
   const replaceQuoted = value.replace(
     /(["'`])([^"'`\r\n]*)\1/g,
@@ -240,13 +280,40 @@ function replaceStructuredFileNameReferences(
     },
   );
 
-  return replaceUrls.replace(
+  const replaceDirectives = replaceUrls.replace(
     /((?:sourceMappingURL|sourceURL)=)([^\s*]+)/g,
     (match, prefix: string, token: string) => {
       const replacement = replaceFileNameReference(token, replacements);
       return replacement === token ? match : `${prefix}${replacement}`;
     },
   );
+
+  if (!includeHtmlAttributes) {
+    return replaceDirectives;
+  }
+
+  return replaceDirectives.replace(htmlElementPattern, (element) => {
+    if (element.startsWith("<!--")) {
+      return element;
+    }
+
+    const tagEnd = element.indexOf(">");
+
+    if (tagEnd < 0) {
+      return element;
+    }
+
+    const tag = element.slice(0, tagEnd + 1);
+    const updatedTag = tag.replace(
+      htmlUnquotedUrlAttributePattern,
+      (match, prefix: string, token: string) => {
+        const replacement = replaceFileNameReference(token, replacements);
+        return replacement === token ? match : `${prefix}${replacement}`;
+      },
+    );
+
+    return `${updatedTag}${element.slice(tagEnd + 1)}`;
+  });
 }
 
 function replaceSourceMapFileNameReferences(
@@ -294,16 +361,38 @@ function sourceMapAsset(
   explicitFileName?: string | null,
 ): Rollup.OutputAsset | null {
   const sourceMapPath = sourceMapUrl?.replace(/[?#].*$/, "");
-  const fileName =
-    explicitFileName ??
-    (sourceMapPath === undefined
-      ? `${outputFileName}.map`
-      : posix.normalize(
-          posix.join(posix.dirname(outputFileName), decodeURIComponent(sourceMapPath)),
-        ));
+  let fileName = explicitFileName ?? `${outputFileName}.map`;
+
+  if (explicitFileName === undefined || explicitFileName === null) {
+    if (sourceMapPath !== undefined) {
+      if (/^(?:[A-Za-z][A-Za-z\d+.-]*:|\/\/)/.test(sourceMapPath)) {
+        return null;
+      }
+
+      let decodedPath: string;
+
+      try {
+        decodedPath = decodeURIComponent(sourceMapPath);
+      } catch {
+        return null;
+      }
+
+      fileName = decodedPath.startsWith("/")
+        ? posix.normalize(decodedPath.slice(1))
+        : posix.normalize(posix.join(posix.dirname(outputFileName), decodedPath));
+    }
+  }
+
   const output = bundle[fileName];
 
   return output?.type === "asset" ? output : null;
+}
+
+function javascriptSourceMapUrl(source: string): string | undefined {
+  return (
+    source.match(javascriptSourceMapDirectivePattern)?.[1] ??
+    source.match(sourceMapDirectivePattern)?.[1]
+  );
 }
 
 function rewriteJavaScriptWithSourceMap(
@@ -314,8 +403,7 @@ function rewriteJavaScriptWithSourceMap(
   explicitSourceMapFileName?: string | null,
 ): string {
   const rewrite = rewriteWithSourceMap(source, outputFileName, edits);
-  const directive = source.match(javascriptSourceMapDirectivePattern);
-  const sourceMapUrl = directive?.[1];
+  const sourceMapUrl = javascriptSourceMapUrl(source);
 
   if (sourceMapUrl?.startsWith("data:application/json") === true) {
     const inline = /^data:application\/json(?:;charset=[^;,]+)?(;base64)?,(.*)$/.exec(
@@ -488,10 +576,7 @@ function replaceInlineSourceMapFileNameReferences(
   value: string,
   replacements: ReadonlyMap<string, string>,
 ): string {
-  const directive =
-    value.match(javascriptSourceMapDirectivePattern) ??
-    value.match(sourceMapDirectivePattern);
-  const sourceMapUrl = directive?.[1];
+  const sourceMapUrl = javascriptSourceMapUrl(value);
 
   if (sourceMapUrl?.startsWith("data:application/json") !== true) {
     return value;
@@ -540,7 +625,11 @@ function normalizeFileNameReferences(
   const updatedValue =
     output.type === "asset" && output.fileName.endsWith(".map")
       ? replaceSourceMapFileNameReferences(value, replacements)
-      : replaceStructuredFileNameReferences(value, replacements);
+      : replaceStructuredFileNameReferences(
+          value,
+          replacements,
+          output.type === "asset" && output.fileName.endsWith(".html"),
+        );
 
   return replaceInlineSourceMapFileNameReferences(updatedValue, replacements);
 }
@@ -581,7 +670,10 @@ function outputDependencies(
         }
       }
 
-      for (const token of fileNameReferenceTokens(textValue(output) ?? "")) {
+      for (const token of fileNameReferenceTokens(
+        textValue(output) ?? "",
+        output.type === "asset" && output.fileName.endsWith(".html"),
+      )) {
         for (const sentinel of token.match(hashMarkerSentinelPattern) ?? []) {
           const markerOutputs = outputsBySentinel.get(sentinel);
 
@@ -941,7 +1033,11 @@ function updateOutputFileNameReferences(
     } else if (typeof output.source === "string") {
       const updatedSource = output.fileName.endsWith(".map")
         ? replaceSourceMapFileNameReferences(output.source, replacements)
-        : replaceStructuredFileNameReferences(output.source, replacements);
+        : replaceStructuredFileNameReferences(
+            output.source,
+            replacements,
+            output.fileName.endsWith(".html"),
+          );
       output.source = replaceInlineSourceMapFileNameReferences(
         updatedSource,
         replacements,
