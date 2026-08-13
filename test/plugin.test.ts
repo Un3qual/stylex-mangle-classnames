@@ -308,6 +308,14 @@ describe("stylexMangleClassNames", () => {
     ).not.toThrow();
   });
 
+  test("ignores malformed ltr and rtl application strings", async () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    await runConfigResolved(plugin, "serve");
+    const source = 'globalThis.copy = { ltr: "Welcome {name", rtl: "مرحبا {name" };';
+
+    await expect(runTransform(plugin, source)).resolves.toBeNull();
+  });
+
   test("sorts runtime and extracted generated classes as one set", () => {
     const javascript = outputChunk(
       [
@@ -487,6 +495,17 @@ describe("stylexMangleClassNames", () => {
       code: ['inject({ ltr: ".a{color:red}" });', 'globalThis.className = "a";'].join("\n"),
       map: null,
     });
+  });
+
+  test("leaves extracted class names unchanged during Vite development transforms", async () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    await runConfigResolved(plugin, "serve");
+    const source = [
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+      `globalThis.className = "${PREFIX}1";`,
+    ].join("\n");
+
+    await expect(runTransform(plugin, source)).resolves.toBeNull();
   });
 
   test("does not rewrite individual transforms during production builds", async () => {

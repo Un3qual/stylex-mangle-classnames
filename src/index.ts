@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Plugin, ResolvedConfig, Rollup } from "vite";
 import {
   findCssClassNamesInSelectors,
@@ -39,6 +40,17 @@ function isCssAsset({ output }: TextAsset): boolean {
   return output.fileName.endsWith(".css");
 }
 
+function isCssPreRenderedAsset(asset: Rollup.PreRenderedAsset): boolean {
+  return [...asset.names, ...asset.originalFileNames].some((name) => name.endsWith(".css"));
+}
+
+function replaceHashPlaceholders(pattern: string, source: string): string {
+  return pattern.replace(/\[hash(?::(\d+))?\]/g, (_placeholder, size: string | undefined) => {
+    const length = size === undefined ? 8 : Number.parseInt(size, 10);
+    return createHash("sha256").update(source).digest("base64url").slice(0, length);
+  });
+}
+
 function collisionMessage(className: string, original: string): string {
   return `StyleX mangling generated class ".${className}" would collide with authored CSS (source class: ".${original}").`;
 }
@@ -74,6 +86,7 @@ export default function stylexMangleClassNames(
   const pendingCompiledClassNames = new Set<string>();
   const pendingRuntimeClassNames = new Set<string>();
   let command: ResolvedConfig["command"] = "build";
+  let buildEmitsAssets = true;
 
   function rememberClassName(original: string): void {
     const mangled = mangleStylexClassName(original, classNamePrefix, classNames);
@@ -129,6 +142,33 @@ export default function stylexMangleClassNames(
     },
     configResolved(config) {
       command = config.command;
+      buildEmitsAssets =
+        !config.build.ssr || config.build.ssrEmitAssets || config.build.emitAssets;
+    },
+    outputOptions(outputOptions) {
+      const assetFileNames =
+        outputOptions.assetFileNames ?? "assets/[name]-[hash][extname]";
+
+      return {
+        ...outputOptions,
+        assetFileNames(asset) {
+          const pattern =
+            typeof assetFileNames === "function"
+              ? assetFileNames(asset)
+              : assetFileNames;
+
+          if (!isCssPreRenderedAsset(asset)) {
+            return pattern;
+          }
+
+          const source = assetSourceToString(asset.source);
+          const result = rewriteStylexClassNames(source, classNamePrefix, classNames);
+
+          return result.changed
+            ? replaceHashPlaceholders(pattern, result.code)
+            : pattern;
+        },
+      };
     },
     transform(code, id, transformOptions) {
       if (!isJavaScriptModule(id, transformOptions?.moduleType)) {
@@ -140,8 +180,7 @@ export default function stylexMangleClassNames(
       }
 
       const discovered = findGeneratedClassNames(this, code);
-      const originals = new Set([...discovered.compiled, ...discovered.runtime]);
-      registerClassNames(originals);
+      registerClassNames(discovered.runtime);
       const result = rewriteStylexClassNames(code, classNamePrefix, classNames);
       return result.changed ? { code: result.code, map: null } : null;
     },
@@ -185,7 +224,7 @@ export default function stylexMangleClassNames(
           (className) => !pendingRuntimeClassNames.has(className),
         );
 
-        if (hasExtractedClasses && cssSources.length === 0) {
+        if (buildEmitsAssets && hasExtractedClasses && cssSources.length === 0) {
           this.error(
             "stylex-mangle-classnames: extracted StyleX output requires a bundled CSS asset; import a stylesheet so StyleX can emit CSS before writeBundle",
           );

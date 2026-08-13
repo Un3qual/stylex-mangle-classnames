@@ -238,7 +238,7 @@ async function buildWithExtractedCss(): Promise<{
   };
 }
 
-async function buildExtractedWithoutCssAsset(): Promise<void> {
+async function buildExtractedWithoutCssAsset(ssr = false): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
   const outDir = join(root, "dist");
   temporaryDirectories.push(root);
@@ -249,6 +249,7 @@ async function buildExtractedWithoutCssAsset(): Promise<void> {
       minify: false,
       outDir,
       rollupOptions: { input: "virtual:entry" },
+      ssr,
     },
     configFile: false,
     envFile: false,
@@ -258,6 +259,65 @@ async function buildExtractedWithoutCssAsset(): Promise<void> {
       stylexMangleClassNames({ classNamePrefix: PREFIX }),
     ],
   });
+}
+
+async function buildHashedCss(includeExtraEntry: boolean): Promise<{
+  contents: string;
+  fileName: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+
+  await build({
+    build: {
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: {
+        input: includeExtraEntry
+          ? { extra: "virtual:extra", main: "virtual:main" }
+          : { main: "virtual:main" },
+      },
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      {
+        name: "virtual-hashed-css-entries",
+        resolveId(id) {
+          return id === "virtual:main" || id === "virtual:extra" ? `/${id}.js` : null;
+        },
+        load(id) {
+          if (id === "/virtual:main.js") {
+            return [
+              `inject({ ltr: ".${PREFIX}z{color:blue}" });`,
+              `globalThis.mainClassName = "${PREFIX}z";`,
+            ].join("\n");
+          }
+
+          return id === "/virtual:extra.js"
+            ? `inject({ ltr: ".${PREFIX}1{color:red}" });`
+            : null;
+        },
+      },
+      bundledCss(`.${PREFIX}z{color:blue}`),
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+    ],
+  });
+
+  const assetsDirectory = join(outDir, "assets");
+  const fileName = (await readdir(assetsDirectory)).find((file) => file.endsWith(".css"));
+
+  if (!fileName) {
+    throw new Error("Expected Vite to emit a hashed CSS asset");
+  }
+
+  return {
+    contents: await readFile(join(assetsDirectory, fileName), "utf8"),
+    fileName,
+  };
 }
 
 async function buildWithPrefixClasses(): Promise<string> {
@@ -405,6 +465,15 @@ describe("production output", () => {
     expect(withExtra.fileName).not.toBe(withoutExtra.fileName);
   });
 
+  test("includes cross-entry mapping changes in hashed CSS filenames", async () => {
+    const withoutExtra = await buildHashedCss(false);
+    const withExtra = await buildHashedCss(true);
+
+    expect(withoutExtra.contents).toBe(".a{color:blue}");
+    expect(withExtra.contents).toBe(".b{color:blue}");
+    expect(withExtra.fileName).not.toBe(withoutExtra.fileName);
+  });
+
   test("rewrites StyleX CSS emitted in the output bundle", async () => {
     const output = await buildWithCss(`.${PREFIX}1{color:red}`);
 
@@ -502,5 +571,9 @@ describe("production output", () => {
     await expect(buildExtractedWithoutCssAsset()).rejects.toThrow(
       "extracted StyleX output requires a bundled CSS asset",
     );
+  });
+
+  test("allows extracted output without a bundled CSS asset in SSR builds", async () => {
+    await expect(buildExtractedWithoutCssAsset(true)).resolves.toBeUndefined();
   });
 });

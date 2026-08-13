@@ -278,8 +278,14 @@ export function findStylexClassNamesInRules(source: string, classNamePrefix: str
   const classNames = new Set<string>();
 
   for (const rule of findStylexRules(source)) {
-    for (const className of findStylexClassNamesInSelectors(rule, classNamePrefix)) {
-      classNames.add(className);
+    try {
+      for (const className of findStylexClassNamesInSelectors(rule, classNamePrefix)) {
+        classNames.add(className);
+      }
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== "CssSyntaxError") {
+        throw error;
+      }
     }
   }
 
