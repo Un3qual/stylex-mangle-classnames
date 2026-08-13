@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
-import type { Plugin, ResolvedConfig, Rollup } from "vite";
+import { parseAst, type Plugin, type ResolvedConfig, type Rollup } from "vite";
+import { findStylexClassNamesInSelectors } from "../src/class-names.js";
 import stylexMangleClassNames from "../src/index.js";
 
 const PREFIX = "sx";
@@ -22,6 +23,89 @@ function outputAsset(fileName: string, source: string): Rollup.OutputAsset {
 }
 
 function runGenerateBundle(plugin: Plugin, bundle: Rollup.OutputBundle): void {
+  const context = {
+    error(error: Rollup.RollupError | string): never {
+      throw new Error(typeof error === "string" ? error : error.message);
+    },
+    parse: parseAst,
+  } as unknown as Rollup.PluginContext;
+  const buildStart = plugin.buildStart;
+
+  if (buildStart) {
+    const handler = typeof buildStart === "function" ? buildStart : buildStart.handler;
+    handler.call(context, {} as Rollup.NormalizedInputOptions);
+  }
+
+  const transform = plugin.transform;
+
+  if (transform) {
+    const handler = typeof transform === "function" ? transform : transform.handler;
+
+    for (const output of Object.values(bundle)) {
+      if (output.type !== "chunk") {
+        continue;
+      }
+
+      const result = handler.call(
+        context as unknown as Rollup.TransformPluginContext,
+        output.code,
+        output.fileName,
+        { moduleType: "js" },
+      ) as { code: string } | string | null;
+
+      if (result instanceof Promise) {
+        throw new Error("Expected the test transform hook to be synchronous");
+      }
+
+      if (typeof result === "string") {
+        output.code = result;
+      } else if (result?.code) {
+        output.code = result.code;
+      }
+    }
+  }
+
+  const renderStart = plugin.renderStart;
+
+  if (renderStart) {
+    const handler = typeof renderStart === "function" ? renderStart : renderStart.handler;
+    handler.call(
+      context,
+      {} as Rollup.NormalizedOutputOptions,
+      {} as Rollup.NormalizedInputOptions,
+    );
+  }
+
+  const renderChunk = plugin.renderChunk;
+
+  if (renderChunk) {
+    const handler = typeof renderChunk === "function" ? renderChunk : renderChunk.handler;
+
+    for (const output of Object.values(bundle)) {
+      if (output.type !== "chunk") {
+        continue;
+      }
+
+      const result = handler.call(
+        context,
+        output.code,
+        output,
+        {} as Rollup.NormalizedOutputOptions,
+        {} as never,
+      ) as { code: string } | string | null;
+
+      if (result instanceof Promise) {
+        throw new Error("Expected the test renderChunk hook to be synchronous");
+      }
+
+      if (typeof result === "string") {
+        output.code = result;
+      } else if (result?.code) {
+        output.code = result.code;
+      }
+    }
+  }
+
   const hook = plugin.generateBundle;
 
   if (!hook) {
@@ -31,11 +115,7 @@ function runGenerateBundle(plugin: Plugin, bundle: Rollup.OutputBundle): void {
   const handler = typeof hook === "function" ? hook : hook.handler;
 
   handler.call(
-    {
-      error(error: Rollup.RollupError | string): never {
-        throw new Error(typeof error === "string" ? error : error.message);
-      },
-    } as Rollup.PluginContext,
+    context,
     {} as Rollup.NormalizedOutputOptions,
     bundle,
     false,
@@ -75,7 +155,12 @@ async function runTransform(plugin: Plugin, code: string) {
   }
 
   const handler = typeof hook === "function" ? hook : hook.handler;
-  return handler.call({} as never, code, "/virtual-entry.js", { moduleType: "js" });
+  return handler.call(
+    { parse: parseAst } as unknown as Rollup.TransformPluginContext,
+    code,
+    "/virtual-entry.js",
+    { moduleType: "js" },
+  );
 }
 
 describe("stylexMangleClassNames", () => {
@@ -121,7 +206,12 @@ describe("stylexMangleClassNames", () => {
   });
 
   test("discovers extracted StyleX classes from matching selectors and references", () => {
-    const javascript = outputChunk(`globalThis.className = "${PREFIX}1";`);
+    const javascript = outputChunk(
+      [
+        `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+        `globalThis.className = "${PREFIX}1";`,
+      ].join("\n"),
+    );
     const css = outputAsset("styles.css", `.${PREFIX}1{color:red}`);
     const html = outputAsset("index.html", `<main class="${PREFIX}1"></main>`);
     const bundle = {
@@ -132,9 +222,51 @@ describe("stylexMangleClassNames", () => {
 
     runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), bundle);
 
-    expect(javascript.code).toBe('globalThis.className = "a";');
+    expect(javascript.code).toContain('globalThis.style = { color: "a", $$css: true };');
+    expect(javascript.code).toContain('globalThis.className = "a";');
     expect(css.source).toBe(".a{color:red}");
     expect(html.source).toBe('<main class="a"></main>');
+  });
+
+  test("discovers classes only from CSS selector preludes", () => {
+    const source = [
+      `/* .${PREFIX}commented */`,
+      `.icon::before{content:".${PREFIX}value"}`,
+      `@supports selector(.${PREFIX}condition){.${PREFIX}nested:hover{color:red}}`,
+    ].join("\n");
+
+    expect(findStylexClassNamesInSelectors(source, PREFIX)).toEqual(
+      new Set([`${PREFIX}nested`]),
+    );
+  });
+
+  test("does not parse runtime rule objects from CSS assets", () => {
+    const css = outputAsset("styles.css", String.raw`:root{--ltr:"\a"}`);
+
+    expect(() =>
+      runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+        [css.fileName]: css,
+      }),
+    ).not.toThrow();
+  });
+
+  test("sorts runtime and extracted generated classes as one set", () => {
+    const javascript = outputChunk(
+      [
+        `inject({ ltr: ".${PREFIX}z{color:blue}" });`,
+        `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+        `globalThis.className = "${PREFIX}z ${PREFIX}1";`,
+      ].join("\n"),
+    );
+    const css = outputAsset("styles.css", `.${PREFIX}1{color:red}`);
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [javascript.fileName]: javascript,
+      [css.fileName]: css,
+    });
+
+    expect(javascript.code.split("\n").at(-1)).toBe('globalThis.className = "b a";');
+    expect(css.source).toBe(".a{color:red}");
   });
 
   test("preserves StyleX constants, custom properties, keyframes, and unrelated classes", () => {
@@ -212,7 +344,9 @@ describe("stylexMangleClassNames", () => {
   });
 
   test("fails when an extracted generated short name collides with authored CSS", () => {
-    const javascript = outputChunk(`globalThis.className = "${PREFIX}1";`);
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    );
     const css = outputAsset("styles.css", `.${PREFIX}1{color:red}.a{color:blue}`);
 
     expect(() =>

@@ -32,6 +32,8 @@ function atomicClassSelectorPattern(classNamePrefix: string): RegExp {
   return new RegExp(`\\.(${prefix}(?:0|[1-9a-z][0-9a-z]*))(?![${CSS_IDENTIFIER_CHARACTER}])`, "g");
 }
 
+const classSelectorPattern = /\.([_A-Za-z][_A-Za-z0-9-]*)/g;
+
 const stylexRulePattern = /\b(?:ltr|rtl)\s*:\s*(?:`([^`]*)`|"((?:\\.|[^"\\])*)")/g;
 
 function isStylexConstKey(source: string, classNameOffset: number): boolean {
@@ -84,17 +86,78 @@ export function mangleStylexClassName(
   return mangled;
 }
 
+function findClassNamesInSelectorPreludes(source: string, pattern: RegExp): Set<string> {
+  const classNames = new Set<string>();
+  let comment = false;
+  let escaped = false;
+  let prelude = "";
+  let quote: '"' | "'" | null = null;
+
+  function collectPrelude(): void {
+    const selector = prelude.trim();
+
+    if (selector !== "" && !selector.startsWith("@")) {
+      for (const match of selector.matchAll(pattern)) {
+        classNames.add(match[1]!);
+      }
+    }
+
+    prelude = "";
+  }
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index]!;
+    const nextCharacter = source[index + 1];
+
+    if (comment) {
+      if (character === "*" && nextCharacter === "/") {
+        comment = false;
+        index += 1;
+      }
+
+      continue;
+    }
+
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = null;
+      }
+
+      continue;
+    }
+
+    if (character === "/" && nextCharacter === "*") {
+      comment = true;
+      prelude += " ";
+      index += 1;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+      prelude += " ";
+    } else if (character === "{") {
+      collectPrelude();
+    } else if (character === ";" || character === "}") {
+      prelude = "";
+    } else {
+      prelude += character;
+    }
+  }
+
+  return classNames;
+}
+
+export function findCssClassNamesInSelectors(source: string): Set<string> {
+  return findClassNamesInSelectorPreludes(source, classSelectorPattern);
+}
+
 export function findStylexClassNamesInSelectors(
   source: string,
   classNamePrefix: string,
 ): Set<string> {
-  const classNames = new Set<string>();
-
-  for (const match of source.matchAll(atomicClassSelectorPattern(classNamePrefix))) {
-    classNames.add(match[1]!);
-  }
-
-  return classNames;
+  return findClassNamesInSelectorPreludes(source, atomicClassSelectorPattern(classNamePrefix));
 }
 
 export function findStylexClassNameReferences(
@@ -111,6 +174,84 @@ export function findStylexClassNameReferences(
     }
   }
 
+  return classNames;
+}
+
+type AstRecord = Record<string, unknown>;
+
+function astRecord(value: unknown): AstRecord | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as AstRecord)
+    : null;
+}
+
+function propertyName(property: AstRecord): string | null {
+  const key = astRecord(property.key);
+
+  if (key?.type === "Identifier" && typeof key.name === "string") {
+    return key.name;
+  }
+
+  return key?.type === "Literal" && typeof key.value === "string" ? key.value : null;
+}
+
+function literalValue(property: AstRecord): unknown {
+  const value = astRecord(property.value);
+  return value?.type === "Literal" ? value.value : undefined;
+}
+
+export function findStylexClassNamesInCompiledObjects(
+  ast: unknown,
+  classNamePrefix: string,
+): Set<string> {
+  const classNames = new Set<string>();
+
+  function visit(value: unknown): void {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        visit(item);
+      }
+
+      return;
+    }
+
+    const node = astRecord(value);
+
+    if (node === null) {
+      return;
+    }
+
+    if (node.type === "ObjectExpression" && Array.isArray(node.properties)) {
+      const properties = node.properties
+        .map(astRecord)
+        .filter((property): property is AstRecord => property !== null);
+      const isCompiledStyle = properties.some(
+        (property) => propertyName(property) === "$$css" && literalValue(property) === true,
+      );
+
+      if (isCompiledStyle) {
+        for (const property of properties) {
+          if (propertyName(property) === "$$css") {
+            continue;
+          }
+
+          const value = literalValue(property);
+
+          if (typeof value === "string") {
+            for (const className of findStylexClassNameReferences(value, classNamePrefix)) {
+              classNames.add(className);
+            }
+          }
+        }
+      }
+    }
+
+    for (const child of Object.values(node)) {
+      visit(child);
+    }
+  }
+
+  visit(ast);
   return classNames;
 }
 

@@ -64,7 +64,6 @@
     "mangle"
   ],
   "dependencies": {
-    "@ampproject/remapping": "^2.3.0",
     "magic-string": "^1.1.1"
   }
 }
