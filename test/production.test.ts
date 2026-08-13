@@ -450,6 +450,73 @@ async function buildCssEmittedAfterMangler(): Promise<string[]> {
   return readdir(join(outDir, "assets"));
 }
 
+async function buildWithAuthoredPreliminaryFileNameText(): Promise<{
+  cssFileName: string;
+  javascript: string;
+  preliminaryCssFileName: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+  let cssReferenceId: string;
+  let preliminaryCssFileName = "";
+
+  await build({
+    build: {
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: { input: "virtual:entry" },
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      virtualExtractedEntry(),
+      {
+        name: "authored-preliminary-filename-text",
+        buildStart() {
+          cssReferenceId = this.emitFile({
+            name: "stylex.css",
+            source: `.${PREFIX}1{color:red}`,
+            type: "asset",
+          });
+        },
+        generateBundle(_outputOptions, bundle) {
+          preliminaryCssFileName = this.getFileName(cssReferenceId);
+          const javascript = Object.values(bundle).find(
+            (output): output is Rollup.OutputChunk => output.type === "chunk",
+          );
+
+          if (javascript === undefined) {
+            throw new Error("Expected a JavaScript chunk");
+          }
+
+          javascript.code += `\nglobalThis.copy = ${JSON.stringify(
+            `application-copy: ${preliminaryCssFileName}`,
+          )};`;
+        },
+      },
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+    ],
+  });
+
+  const assetsDirectory = join(outDir, "assets");
+  const files = await readdir(assetsDirectory);
+  const cssFileName = files.find((file) => file.endsWith(".css"));
+  const javascriptFileName = files.find((file) => file.endsWith(".js"));
+
+  if (!cssFileName || !javascriptFileName) {
+    throw new Error("Expected JavaScript and CSS output");
+  }
+
+  return {
+    cssFileName: `assets/${cssFileName}`,
+    javascript: await readFile(join(assetsDirectory, javascriptFileName), "utf8"),
+    preliminaryCssFileName,
+  };
+}
+
 async function buildTreeShakenRuntimeRule(): Promise<{ css: string; javascript: string }> {
   const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
   const outDir = join(root, "dist");
@@ -961,6 +1028,17 @@ describe("production output", () => {
 
     expect(cssFile).toBeDefined();
     expect(cssFile).not.toContain("_S");
+  });
+
+  test("preserves authored text containing a preliminary output filename", async () => {
+    const output = await buildWithAuthoredPreliminaryFileNameText();
+
+    expect(output.preliminaryCssFileName).toContain("__STYLEX_HASH_");
+    expect(output.cssFileName).not.toBe(output.preliminaryCssFileName);
+    expect(output.javascript).toContain(
+      `application-copy: ${output.preliminaryCssFileName}`,
+    );
+    expect(output.javascript).not.toContain(`application-copy: ${output.cssFileName}`);
   });
 
   test("does not reserve class names from tree-shaken runtime rules", async () => {

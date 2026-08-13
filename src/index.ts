@@ -158,6 +158,135 @@ function replaceFileNameReferences(
   return result;
 }
 
+function replaceFileNameReference(
+  value: string,
+  replacements: ReadonlyMap<string, string>,
+): string {
+  const suffixIndex = value.search(/[?#]/);
+  const path = suffixIndex < 0 ? value : value.slice(0, suffixIndex);
+  const suffix = suffixIndex < 0 ? "" : value.slice(suffixIndex);
+  const orderedReplacements = [...replacements].sort(
+    ([left], [right]) => right.length - left.length,
+  );
+
+  for (const [before, after] of orderedReplacements) {
+    if (path === before) {
+      return `${after}${suffix}`;
+    }
+
+    if (!path.endsWith(before)) {
+      continue;
+    }
+
+    const prefix = path.slice(0, -before.length);
+
+    if (
+      /^(?:(?:\.\.?\/)+|\/[^\s]*\/|(?:https?:)?\/\/[^\s]+\/)$/i.test(prefix)
+    ) {
+      return `${prefix}${after}${suffix}`;
+    }
+  }
+
+  return value;
+}
+
+function fileNameReferenceTokens(value: string): string[] {
+  const tokens: string[] = [];
+  const quotedPattern = /(["'`])([^"'`\r\n]*)\1/g;
+
+  for (const match of value.matchAll(quotedPattern)) {
+    const token = match[2];
+
+    if (token !== undefined) {
+      tokens.push(token);
+    }
+  }
+
+  for (const match of value.matchAll(/\burl\(\s*([^"')\s][^)]*?)\s*\)/gi)) {
+    const token = match[1];
+
+    if (token !== undefined) {
+      tokens.push(token);
+    }
+  }
+
+  for (const match of value.matchAll(/(?:sourceMappingURL|sourceURL)=([^\s*]+)/g)) {
+    const token = match[1];
+
+    if (token !== undefined) {
+      tokens.push(token);
+    }
+  }
+
+  return tokens;
+}
+
+function replaceStructuredFileNameReferences(
+  value: string,
+  replacements: ReadonlyMap<string, string>,
+): string {
+  const replaceQuoted = value.replace(
+    /(["'`])([^"'`\r\n]*)\1/g,
+    (match, quote: string, token: string) => {
+      const replacement = replaceFileNameReference(token, replacements);
+      return replacement === token ? match : `${quote}${replacement}${quote}`;
+    },
+  );
+  const replaceUrls = replaceQuoted.replace(
+    /\burl\(\s*([^"')\s][^)]*?)\s*\)/gi,
+    (match, token: string) => {
+      const replacement = replaceFileNameReference(token, replacements);
+      return replacement === token ? match : match.replace(token, replacement);
+    },
+  );
+
+  return replaceUrls.replace(
+    /((?:sourceMappingURL|sourceURL)=)([^\s*]+)/g,
+    (match, prefix: string, token: string) => {
+      const replacement = replaceFileNameReference(token, replacements);
+      return replacement === token ? match : `${prefix}${replacement}`;
+    },
+  );
+}
+
+function replaceSourceMapFileNameReferences(
+  value: string,
+  replacements: ReadonlyMap<string, string>,
+): string {
+  try {
+    const sourceMap = JSON.parse(value) as {
+      file?: unknown;
+      sources?: unknown;
+    };
+    let changed = false;
+
+    if (typeof sourceMap.file === "string") {
+      const replacement = replaceFileNameReference(sourceMap.file, replacements);
+
+      if (replacement !== sourceMap.file) {
+        sourceMap.file = replacement;
+        changed = true;
+      }
+    }
+
+    if (Array.isArray(sourceMap.sources)) {
+      sourceMap.sources = sourceMap.sources.map((source) => {
+        if (typeof source !== "string") {
+          return source;
+        }
+
+        const replacement = replaceFileNameReference(source, replacements);
+        changed ||= replacement !== source;
+        return replacement;
+      });
+    }
+
+    return changed ? JSON.stringify(sourceMap) : value;
+  } catch {
+    return value;
+  }
+}
+
 function sourceMapAsset(
   bundle: Rollup.OutputBundle,
   outputFileName: string,
@@ -382,7 +511,7 @@ function replaceInlineSourceMapFileNameReferences(
     const sourceMap = isBase64
       ? Buffer.from(encodedMap, "base64").toString("utf8")
       : decodeURIComponent(encodedMap);
-    const updatedMap = replaceFileNameReferences(sourceMap, replacements);
+    const updatedMap = replaceSourceMapFileNameReferences(sourceMap, replacements);
 
     if (updatedMap === sourceMap) {
       return value;
@@ -399,6 +528,7 @@ function replaceInlineSourceMapFileNameReferences(
 }
 
 function normalizeFileNameReferences(
+  output: OutputFile,
   value: string,
   externalReplacements: ReadonlyMap<string, string>,
   internalReplacements: ReadonlyMap<string, string>,
@@ -407,7 +537,10 @@ function normalizeFileNameReferences(
     ...externalReplacements,
     ...internalReplacements,
   ]);
-  const updatedValue = replaceFileNameReferences(value, replacements);
+  const updatedValue =
+    output.type === "asset" && output.fileName.endsWith(".map")
+      ? replaceSourceMapFileNameReferences(value, replacements)
+      : replaceStructuredFileNameReferences(value, replacements);
 
   return replaceInlineSourceMapFileNameReferences(updatedValue, replacements);
 }
@@ -436,14 +569,34 @@ function outputDependencies(
   return new Map(
     outputs.map((output) => {
       const dependencies = new Set<OutputFile>();
-      const values = [textValue(output) ?? "", ...metadataValues(output)];
+      const metadata = metadataValues(output);
 
-      for (const value of values) {
+      for (const value of metadata) {
         for (const sentinel of value.match(hashMarkerSentinelPattern) ?? []) {
           const markerOutputs = outputsBySentinel.get(sentinel);
 
           for (const dependency of markerOutputs ?? []) {
             dependencies.add(dependency);
+          }
+        }
+      }
+
+      for (const token of fileNameReferenceTokens(textValue(output) ?? "")) {
+        for (const sentinel of token.match(hashMarkerSentinelPattern) ?? []) {
+          const markerOutputs = outputsBySentinel.get(sentinel);
+
+          for (const dependency of markerOutputs ?? []) {
+            const preliminaryFileName = requiredMapValue(
+              preliminaryFileNames,
+              dependency,
+              "dependency preliminary filename",
+            );
+            const candidates = new Map<string, string>();
+            addFileNameReplacement(candidates, preliminaryFileName, "__reference__");
+
+            if (replaceFileNameReference(token, candidates) !== token) {
+              dependencies.add(dependency);
+            }
           }
         }
       }
@@ -646,12 +799,14 @@ function computeFinalFileNames(
           output.type === "asset" && typeof output.source !== "string"
             ? `binary:${Buffer.from(output.source).toString("base64")}`
             : normalizeFileNameReferences(
+                output,
                 textValue(output) ?? "",
                 externalReplacements,
                 internalReplacements,
               );
         const metadata = metadataValues(output).map((value) =>
           normalizeFileNameReferences(
+            output,
             value,
             externalReplacements,
             internalReplacements,
@@ -733,7 +888,10 @@ function updateOutputFileNameReferences(
 ): void {
   for (const output of outputs) {
     if (output.type === "chunk") {
-      const updatedCode = replaceFileNameReferences(output.code, replacements);
+      const updatedCode = replaceStructuredFileNameReferences(
+        output.code,
+        replacements,
+      );
       output.code = replaceInlineSourceMapFileNameReferences(
         updatedCode,
         replacements,
@@ -781,7 +939,9 @@ function updateOutputFileNameReferences(
         );
       }
     } else if (typeof output.source === "string") {
-      const updatedSource = replaceFileNameReferences(output.source, replacements);
+      const updatedSource = output.fileName.endsWith(".map")
+        ? replaceSourceMapFileNameReferences(output.source, replacements)
+        : replaceStructuredFileNameReferences(output.source, replacements);
       output.source = replaceInlineSourceMapFileNameReferences(
         updatedSource,
         replacements,
