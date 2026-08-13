@@ -30,21 +30,21 @@ type HashCharacters = NonNullable<Rollup.OutputOptions["hashCharacters"]>;
 
 type HashMarker = {
   length: number;
-  token: string;
-};
-
-type CompatiblePreRenderedAsset = Rollup.PreRenderedAsset & {
-  name?: string;
-  names?: readonly string[];
-  originalFileName?: string;
-  originalFileNames?: readonly string[];
+  sentinel: string;
 };
 
 type RenderChunkMeta = {
   chunks?: Record<string, Rollup.RenderedChunk>;
 };
 
+type CompatibleOutputChunk = Rollup.OutputChunk & {
+  implicitlyLoadedBefore?: string[];
+  referencedFiles?: string[];
+};
+
 const sourceMapDirectivePattern = /\/\*[#@]\s*sourceMappingURL=([^\s*]+)\s*\*\/\s*$/;
+const javascriptSourceMapDirectivePattern =
+  /\/\/[#@]\s*sourceMappingURL=([^\s]+)\s*$/;
 
 function assetSourceToString(source: string | Uint8Array): string {
   return typeof source === "string" ? source : new TextDecoder().decode(source);
@@ -67,24 +67,6 @@ function isCssAsset({ output }: TextAsset): boolean {
   return output.fileName.endsWith(".css");
 }
 
-function isCssPreRenderedAsset(
-  asset: Rollup.PreRenderedAsset,
-  pattern: string,
-): boolean {
-  const compatible = asset as CompatiblePreRenderedAsset;
-  const names = [
-    ...(compatible.names ?? []),
-    ...(compatible.originalFileNames ?? []),
-    compatible.name,
-    compatible.originalFileName,
-  ].filter((name): name is string => name !== undefined);
-
-  return (
-    pattern.endsWith(".css") ||
-    names.some((name) => name.endsWith(".css"))
-  );
-}
-
 function contentHash(source: string, hashCharacters: HashCharacters): string {
   const digest = createHash("sha256").update(source).digest();
 
@@ -104,30 +86,56 @@ function markHashPlaceholders(
   markerId: number,
   markers: Map<string, HashMarker>,
 ): string {
-  return pattern.replace(/\[hash(?::(\d+))?\]/g, (_placeholder, size: string | undefined) => {
-    const length = size === undefined ? 8 : Number.parseInt(size, 10);
-    const core = `_S${markerId.toString(36).toUpperCase()}_`;
+  let occurrence = 0;
 
-    if (core.length > length) {
-      throw new Error(
-        `stylex-mangle-classnames: CSS hash length ${length} is too short for final-content hashing`,
-      );
-    }
-
-    const token = core.padEnd(length, "_");
-    markers.set(token, { length, token });
-    return token;
-  });
+  return pattern.replace(
+    /\[hash(?::(\d+))?\]/g,
+    (placeholder, size: string | undefined) => {
+      const length = size === undefined ? 8 : Number.parseInt(size, 10);
+      const sentinel = `__STYLEX_HASH_${markerId.toString(36)}_${occurrence.toString(36)}__`;
+      occurrence += 1;
+      markers.set(sentinel, { length, sentinel });
+      return `${placeholder}${sentinel}`;
+    },
+  );
 }
 
-function replaceHashMarkers(value: string, hashes: ReadonlyMap<string, string>): string {
+function replaceHashMarkers(
+  value: string,
+  hashes: ReadonlyMap<string, string>,
+  markers: ReadonlyMap<string, HashMarker>,
+): string {
   let result = value;
 
-  for (const [marker, hash] of hashes) {
-    result = result.replaceAll(marker, hash);
+  for (const [sentinel, hash] of hashes) {
+    const marker = markers.get(sentinel);
+
+    if (marker === undefined) {
+      continue;
+    }
+
+    let sentinelIndex = result.indexOf(sentinel);
+
+    while (sentinelIndex >= marker.length) {
+      const hashStart = sentinelIndex - marker.length;
+      result = `${result.slice(0, hashStart)}${hash}${result.slice(
+        sentinelIndex + sentinel.length,
+      )}`;
+      sentinelIndex = result.indexOf(sentinel, hashStart + hash.length);
+    }
   }
 
   return result;
+}
+
+function nativeHashForMarker(value: string, marker: HashMarker): string | null {
+  const sentinelIndex = value.indexOf(marker.sentinel);
+
+  if (sentinelIndex < marker.length) {
+    return null;
+  }
+
+  return value.slice(sentinelIndex - marker.length, sentinelIndex);
 }
 
 function replaceFileNameReferences(
@@ -143,47 +151,72 @@ function replaceFileNameReferences(
   return result;
 }
 
-function fileNameReplacements(
-  outputs: readonly (readonly [string, Rollup.OutputChunk | Rollup.OutputAsset])[],
-  hashes: ReadonlyMap<string, string>,
-): Map<string, string> {
-  const replacements = new Map<string, string>();
-
-  for (const [, output] of outputs) {
-    const updatedFileName = replaceHashMarkers(output.fileName, hashes);
-
-    if (updatedFileName === output.fileName) {
-      continue;
-    }
-
-    replacements.set(output.fileName, updatedFileName);
-
-    const baseName = posix.basename(output.fileName);
-    const updatedBaseName = posix.basename(updatedFileName);
-
-    if (baseName !== output.fileName) {
-      replacements.set(baseName, updatedBaseName);
-    }
-  }
-
-  return replacements;
-}
-
 function sourceMapAsset(
   bundle: Rollup.OutputBundle,
-  cssFileName: string,
+  outputFileName: string,
   sourceMapUrl?: string,
+  explicitFileName?: string | null,
 ): Rollup.OutputAsset | null {
   const sourceMapPath = sourceMapUrl?.replace(/[?#].*$/, "");
   const fileName =
-    sourceMapPath === undefined
-      ? `${cssFileName}.map`
+    explicitFileName ??
+    (sourceMapPath === undefined
+      ? `${outputFileName}.map`
       : posix.normalize(
-          posix.join(posix.dirname(cssFileName), decodeURIComponent(sourceMapPath)),
-        );
+          posix.join(posix.dirname(outputFileName), decodeURIComponent(sourceMapPath)),
+        ));
   const output = bundle[fileName];
 
   return output?.type === "asset" ? output : null;
+}
+
+function rewriteChunkWithSourceMap(
+  bundle: Rollup.OutputBundle,
+  chunk: Rollup.OutputChunk,
+  source: string,
+  edits: readonly StylexClassNameEdit[],
+): string {
+  const rewrite = rewriteWithSourceMap(source, chunk.fileName, edits);
+  const directive = source.match(javascriptSourceMapDirectivePattern);
+  const sourceMapUrl = directive?.[1];
+
+  if (sourceMapUrl?.startsWith("data:application/json") === true) {
+    const inline = /^data:application\/json(?:;charset=[^;,]+)?(;base64)?,(.*)$/.exec(
+      sourceMapUrl,
+    );
+    const inlineData = inline?.[2];
+
+    if (inline === null || inlineData === undefined) {
+      return rewrite.code;
+    }
+
+    const inputMap = inline[1]
+      ? Buffer.from(inlineData, "base64").toString("utf8")
+      : decodeURIComponent(inlineData);
+    const composed = composeWithSourceMap(rewrite, inputMap);
+    const encoded = inline[1]
+      ? Buffer.from(composed).toString("base64")
+      : encodeURIComponent(composed);
+    const updatedUrl = `data:application/json${inline[1] ? ";base64" : ""},${encoded}`;
+
+    return rewrite.code.replace(sourceMapUrl, updatedUrl);
+  }
+
+  const mapAsset = sourceMapAsset(
+    bundle,
+    chunk.fileName,
+    sourceMapUrl,
+    chunk.sourcemapFileName,
+  );
+
+  if (mapAsset !== null) {
+    mapAsset.source = composeWithSourceMap(
+      rewrite,
+      assetSourceToString(mapAsset.source),
+    );
+  }
+
+  return rewrite.code;
 }
 
 function rewriteCssWithSourceMap(
@@ -237,107 +270,311 @@ function rewriteCssWithSourceMap(
 
 function finalizeOutputHashMarkers(
   bundle: Rollup.OutputBundle,
-  cssAssets: readonly TextAsset[],
   hashCharacters: HashCharacters,
-  cssMarkers: ReadonlyMap<string, HashMarker>,
+  assetMarkers: ReadonlyMap<string, HashMarker>,
   chunkMarkers: ReadonlyMap<string, HashMarker>,
 ): void {
-  const hashes = new Map<string, string>();
+  const markers = new Map([...assetMarkers, ...chunkMarkers]);
 
-  for (const { output } of cssAssets) {
-    const source = assetSourceToString(output.source);
-    let normalizedSource = source;
-
-    for (const { length, token } of cssMarkers.values()) {
-      normalizedSource = normalizedSource.replaceAll(token, "0".repeat(length));
-    }
-
-    const hash = contentHash(normalizedSource, hashCharacters);
-
-    for (const { length, token } of cssMarkers.values()) {
-      if (output.fileName.includes(token)) {
-        hashes.set(token, hash.slice(0, length));
-      }
-    }
-  }
-
-  if (hashes.size === 0 && chunkMarkers.size === 0) {
+  if (markers.size === 0) {
     return;
   }
 
   const outputs = Object.entries(bundle);
-  const cssFileNameReplacements = fileNameReplacements(outputs, hashes);
-  const chunksByMarker = new Map<string, Rollup.OutputChunk>();
+  const outputValues = outputs.map(([, output]) => output);
+  const preliminaryFileNames = new Map(
+    outputValues.map((output) => [output, output.fileName] as const),
+  );
+  const dependencies = new Map<
+    Rollup.OutputChunk | Rollup.OutputAsset,
+    Set<Rollup.OutputChunk | Rollup.OutputAsset>
+  >();
 
-  for (const [, output] of outputs) {
+  function metadataValues(output: Rollup.OutputChunk | Rollup.OutputAsset): string[] {
     if (output.type !== "chunk") {
-      continue;
+      return [];
     }
 
-    for (const { token } of chunkMarkers.values()) {
-      if (output.fileName.includes(token)) {
-        chunksByMarker.set(token, output);
+    const compatible = output as CompatibleOutputChunk;
+
+    return [
+      ...(output.imports ?? []),
+      ...(output.dynamicImports ?? []),
+      ...(compatible.implicitlyLoadedBefore ?? []),
+      ...(compatible.referencedFiles ?? []),
+      ...(output.sourcemapFileName === null || output.sourcemapFileName === undefined
+        ? []
+        : [output.sourcemapFileName]),
+    ];
+  }
+
+  function textValue(output: Rollup.OutputChunk | Rollup.OutputAsset): string | null {
+    if (output.type === "chunk") {
+      return output.code;
+    }
+
+    return typeof output.source === "string" ? output.source : null;
+  }
+
+  for (const output of outputValues) {
+    const values = [textValue(output) ?? "", ...metadataValues(output)];
+    const referencedOutputs = new Set<Rollup.OutputChunk | Rollup.OutputAsset>();
+
+    for (const candidate of outputValues) {
+      const fileName = preliminaryFileNames.get(candidate)!;
+      const baseName = posix.basename(fileName);
+
+      if (values.some((value) => value.includes(fileName) || value.includes(baseName))) {
+        referencedOutputs.add(candidate);
       }
+    }
+
+    dependencies.set(output, referencedOutputs);
+  }
+
+  const indices = new Map<Rollup.OutputChunk | Rollup.OutputAsset, number>();
+  const lowLinks = new Map<Rollup.OutputChunk | Rollup.OutputAsset, number>();
+  const stack: (Rollup.OutputChunk | Rollup.OutputAsset)[] = [];
+  const onStack = new Set<Rollup.OutputChunk | Rollup.OutputAsset>();
+  const groups: (Rollup.OutputChunk | Rollup.OutputAsset)[][] = [];
+  let nextIndex = 0;
+
+  function connect(output: Rollup.OutputChunk | Rollup.OutputAsset): void {
+    indices.set(output, nextIndex);
+    lowLinks.set(output, nextIndex);
+    nextIndex += 1;
+    stack.push(output);
+    onStack.add(output);
+
+    for (const dependency of dependencies.get(output) ?? []) {
+      if (!indices.has(dependency)) {
+        connect(dependency);
+        lowLinks.set(
+          output,
+          Math.min(lowLinks.get(output)!, lowLinks.get(dependency)!),
+        );
+      } else if (onStack.has(dependency)) {
+        lowLinks.set(
+          output,
+          Math.min(lowLinks.get(output)!, indices.get(dependency)!),
+        );
+      }
+    }
+
+    if (lowLinks.get(output) !== indices.get(output)) {
+      return;
+    }
+
+    const group: (Rollup.OutputChunk | Rollup.OutputAsset)[] = [];
+    let member: Rollup.OutputChunk | Rollup.OutputAsset;
+
+    do {
+      member = stack.pop()!;
+      onStack.delete(member);
+      group.push(member);
+    } while (member !== output);
+
+    groups.push(group);
+  }
+
+  for (const output of outputValues) {
+    if (!indices.has(output)) {
+      connect(output);
     }
   }
 
-  const computingChunkHashes = new Set<string>();
+  const groupByOutput = new Map<Rollup.OutputChunk | Rollup.OutputAsset, number>();
 
-  function computeChunkHash(token: string): string {
-    const existing = hashes.get(token);
+  groups.forEach((group, groupIndex) => {
+    for (const output of group) {
+      groupByOutput.set(output, groupIndex);
+    }
+  });
 
-    if (existing !== undefined) {
-      return existing;
+  const hashes = new Map<string, string>();
+  const finalFileNames = new Map<Rollup.OutputChunk | Rollup.OutputAsset, string>();
+  const completedGroups = new Set<number>();
+
+  function addReplacement(
+    replacements: Map<string, string>,
+    before: string,
+    after: string,
+  ): void {
+    replacements.set(before, after);
+    const beforeBaseName = posix.basename(before);
+
+    if (beforeBaseName !== before) {
+      replacements.set(beforeBaseName, posix.basename(after));
+    }
+  }
+
+  function normalizeValue(
+    value: string,
+    externalReplacements: ReadonlyMap<string, string>,
+    internalReplacements: ReadonlyMap<string, string>,
+  ): string {
+    return replaceFileNameReferences(
+      replaceFileNameReferences(value, externalReplacements),
+      internalReplacements,
+    );
+  }
+
+  function computeGroup(groupIndex: number): void {
+    if (completedGroups.has(groupIndex)) {
+      return;
     }
 
-    const marker = chunkMarkers.get(token);
-    const output = chunksByMarker.get(token);
+    const group = groups[groupIndex]!;
+    const groupSet = new Set(group);
 
-    if (marker === undefined || output === undefined) {
-      return token;
-    }
+    for (const output of group) {
+      for (const dependency of dependencies.get(output) ?? []) {
+        const dependencyGroup = groupByOutput.get(dependency)!;
 
-    if (computingChunkHashes.has(token)) {
-      return "0".repeat(marker.length);
-    }
-
-    computingChunkHashes.add(token);
-    let source = replaceFileNameReferences(output.code, cssFileNameReplacements);
-
-    for (const [dependencyToken, dependencyOutput] of chunksByMarker) {
-      if (!source.includes(dependencyToken)) {
-        continue;
+        if (dependencyGroup !== groupIndex) {
+          computeGroup(dependencyGroup);
+        }
       }
+    }
 
-      const dependencyHash = computeChunkHash(dependencyToken);
-      const dependencyReplacements = fileNameReplacements(
-        [[dependencyOutput.fileName, dependencyOutput]],
-        new Map([[dependencyToken, dependencyHash]]),
+    const externalReplacements = new Map<string, string>();
+    const internalReplacements = new Map<string, string>();
+    const orderedGroup = [...group].sort((left, right) =>
+      preliminaryFileNames.get(left)!.localeCompare(preliminaryFileNames.get(right)!),
+    );
+
+    for (const output of outputValues) {
+      const finalFileName = finalFileNames.get(output);
+
+      if (finalFileName !== undefined && !groupSet.has(output)) {
+        addReplacement(
+          externalReplacements,
+          preliminaryFileNames.get(output)!,
+          finalFileName,
+        );
+      }
+    }
+
+    orderedGroup.forEach((output, memberIndex) => {
+      addReplacement(
+        internalReplacements,
+        preliminaryFileNames.get(output)!,
+        `__STYLEX_INTERNAL_${memberIndex}__`,
       );
-      source = replaceFileNameReferences(source, dependencyReplacements);
+    });
+
+    const groupSeed = orderedGroup
+      .map((output) => {
+        const fileName = preliminaryFileNames.get(output)!;
+        const outputMarkers = [...markers.values()].filter(({ sentinel }) =>
+          fileName.includes(sentinel),
+        );
+        const nativeHashes = outputMarkers.map(
+          (marker) => nativeHashForMarker(fileName, marker) ?? "",
+        );
+        const source =
+          output.type === "asset" && typeof output.source !== "string"
+            ? `binary:${Buffer.from(output.source).toString("base64")}`
+            : normalizeValue(
+                textValue(output) ?? "",
+                externalReplacements,
+                internalReplacements,
+              );
+        const metadata = metadataValues(output).map((value) =>
+          normalizeValue(value, externalReplacements, internalReplacements),
+        );
+        const zeroHashes = new Map(
+          outputMarkers.map(({ length, sentinel }) => [
+            sentinel,
+            "0".repeat(length),
+          ]),
+        );
+
+        return JSON.stringify({
+          fileName: replaceHashMarkers(fileName, zeroHashes, markers),
+          metadata,
+          nativeHashes,
+          source,
+          type: output.type,
+        });
+      })
+      .join("\0");
+
+    orderedGroup.forEach((output, memberIndex) => {
+      const fileName = preliminaryFileNames.get(output)!;
+
+      for (const marker of markers.values()) {
+        if (!fileName.includes(marker.sentinel)) {
+          continue;
+        }
+
+        hashes.set(
+          marker.sentinel,
+          contentHash(
+            `${groupSeed}\0${memberIndex}\0${marker.sentinel}`,
+            hashCharacters,
+          ).slice(0, marker.length),
+        );
+      }
+    });
+
+    for (const output of orderedGroup) {
+      finalFileNames.set(
+        output,
+        replaceHashMarkers(preliminaryFileNames.get(output)!, hashes, markers),
+      );
     }
 
-    for (const { length, token: unresolvedToken } of chunkMarkers.values()) {
-      source = source.replaceAll(unresolvedToken, "0".repeat(length));
+    completedGroups.add(groupIndex);
+  }
+
+  for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
+    computeGroup(groupIndex);
+  }
+
+  const finalizedFileNameReplacements = new Map<string, string>();
+
+  for (const output of outputValues) {
+    const before = preliminaryFileNames.get(output)!;
+    const after = finalFileNames.get(output) ?? before;
+
+    if (before !== after) {
+      addReplacement(finalizedFileNameReplacements, before, after);
     }
-
-    computingChunkHashes.delete(token);
-    const hash = contentHash(source, hashCharacters).slice(0, marker.length);
-    hashes.set(token, hash);
-    return hash;
   }
-
-  for (const token of chunksByMarker.keys()) {
-    computeChunkHash(token);
-  }
-
-  const finalizedFileNameReplacements = fileNameReplacements(outputs, hashes);
 
   for (const [, output] of outputs) {
     if (output.type === "chunk") {
       output.code = replaceFileNameReferences(output.code, finalizedFileNameReplacements);
-    } else {
-      const source = assetSourceToString(output.source);
+      output.imports = (output.imports ?? []).map((value) =>
+        replaceFileNameReferences(value, finalizedFileNameReplacements),
+      );
+      output.dynamicImports = (output.dynamicImports ?? []).map((value) =>
+        replaceFileNameReferences(value, finalizedFileNameReplacements),
+      );
+      const compatible = output as CompatibleOutputChunk;
+
+      if (compatible.implicitlyLoadedBefore !== undefined) {
+        compatible.implicitlyLoadedBefore = compatible.implicitlyLoadedBefore.map(
+          (value) =>
+            replaceFileNameReferences(value, finalizedFileNameReplacements),
+        );
+      }
+
+      if (compatible.referencedFiles !== undefined) {
+        compatible.referencedFiles = compatible.referencedFiles.map((value) =>
+          replaceFileNameReferences(value, finalizedFileNameReplacements),
+        );
+      }
+
+      if (output.sourcemapFileName !== null && output.sourcemapFileName !== undefined) {
+        output.sourcemapFileName = replaceFileNameReferences(
+          output.sourcemapFileName,
+          finalizedFileNameReplacements,
+        );
+      }
+    } else if (typeof output.source === "string") {
+      const source = output.source;
       const updatedSource = replaceFileNameReferences(
         source,
         finalizedFileNameReplacements,
@@ -349,14 +586,28 @@ function finalizeOutputHashMarkers(
     }
   }
 
+  const canRekeyBundle = outputs.every(([, output]) => {
+    const descriptor = Object.getOwnPropertyDescriptor(
+      output,
+      output.type === "chunk" ? "code" : "source",
+    );
+
+    return descriptor?.get === undefined;
+  });
+
   for (const [, output] of outputs) {
-    const updatedFileName = finalizedFileNameReplacements.get(output.fileName);
+    output.fileName = finalFileNames.get(output) ?? output.fileName;
+  }
 
-    if (updatedFileName === undefined) {
-      continue;
+  if (canRekeyBundle) {
+    for (const [bundleKey, output] of outputs) {
+      if (bundleKey === output.fileName) {
+        continue;
+      }
+
+      bundle[output.fileName] = output;
+      delete bundle[bundleKey];
     }
-
-    output.fileName = updatedFileName;
   }
 }
 
@@ -398,10 +649,11 @@ export default function stylexMangleClassNames(
   let buildEmitsAssets = true;
   let assetHashMarkerIds = new WeakMap<object, number>();
   let chunkHashMarkerIds = new WeakMap<object, number>();
-  const cssHashMarkers = new Map<string, HashMarker>();
+  const assetHashMarkers = new Map<string, HashMarker>();
   const chunkHashMarkers = new Map<string, HashMarker>();
   let nextHashMarkerId = 0;
   let cssAssetsFinalized = false;
+  let hasCompleteRenderChunkGraph = false;
 
   function rememberClassName(original: string): void {
     const mangled = mangleStylexClassName(original, classNamePrefix, classNames);
@@ -459,7 +711,7 @@ export default function stylexMangleClassNames(
     closeBundle() {
       assetHashMarkerIds = new WeakMap<object, number>();
       chunkHashMarkerIds = new WeakMap<object, number>();
-      cssHashMarkers.clear();
+      assetHashMarkers.clear();
       chunkHashMarkers.clear();
       nextHashMarkerId = 0;
     },
@@ -469,10 +721,17 @@ export default function stylexMangleClassNames(
         !config.build.ssr || config.build.ssrEmitAssets || config.build.emitAssets;
     },
     outputOptions(outputOptions) {
+      assetHashMarkerIds = new WeakMap<object, number>();
+      chunkHashMarkerIds = new WeakMap<object, number>();
+      assetHashMarkers.clear();
+      chunkHashMarkers.clear();
+      nextHashMarkerId = 0;
+      cssAssetsFinalized = false;
       const assetFileNames =
         outputOptions.assetFileNames ?? "assets/[name]-[hash][extname]";
       const entryFileNames = outputOptions.entryFileNames;
       const chunkFileNames = outputOptions.chunkFileNames;
+      const sourcemapFileNames = outputOptions.sourcemapFileNames;
 
       function markedChunkFileName(
         pattern: string | ((chunk: Rollup.PreRenderedChunk) => string),
@@ -505,13 +764,36 @@ export default function stylexMangleClassNames(
               chunkFileNames: (chunk: Rollup.PreRenderedChunk) =>
                 markedChunkFileName(chunkFileNames, chunk),
             }),
+        ...(sourcemapFileNames === undefined
+          ? {}
+          : {
+              sourcemapFileNames: (chunk: Rollup.PreRenderedChunk) => {
+                const resolvedPattern =
+                  typeof sourcemapFileNames === "function"
+                    ? sourcemapFileNames(chunk)
+                    : sourcemapFileNames;
+                let markerId = assetHashMarkerIds.get(chunk);
+
+                if (markerId === undefined) {
+                  markerId = nextHashMarkerId;
+                  nextHashMarkerId += 1;
+                  assetHashMarkerIds.set(chunk, markerId);
+                }
+
+                return markHashPlaceholders(
+                  resolvedPattern,
+                  markerId,
+                  assetHashMarkers,
+                );
+              },
+            }),
         assetFileNames(asset) {
           const pattern =
             typeof assetFileNames === "function"
               ? assetFileNames(asset)
               : assetFileNames;
 
-          if (cssAssetsFinalized || !isCssPreRenderedAsset(asset, pattern)) {
+          if (cssAssetsFinalized) {
             return pattern;
           }
 
@@ -523,7 +805,7 @@ export default function stylexMangleClassNames(
             assetHashMarkerIds.set(asset, markerId);
           }
 
-          return markHashPlaceholders(pattern, markerId, cssHashMarkers);
+          return markHashPlaceholders(pattern, markerId, assetHashMarkers);
         },
       };
     },
@@ -542,13 +824,17 @@ export default function stylexMangleClassNames(
     },
     renderStart() {
       cssAssetsFinalized = false;
+      hasCompleteRenderChunkGraph = false;
       pendingCompiledClassNames.clear();
       pendingRuntimeClassNames.clear();
     },
     renderChunk(code, chunk, _outputOptions, meta?: RenderChunkMeta) {
-      const renderedChunks = meta?.chunks
-        ? Object.values(meta.chunks)
-        : [chunk];
+      if (meta?.chunks === undefined) {
+        return null;
+      }
+
+      hasCompleteRenderChunkGraph = true;
+      const renderedChunks = Object.values(meta.chunks);
       const renderedSources = new Set<string>();
 
       for (const renderedChunk of renderedChunks) {
@@ -583,6 +869,55 @@ export default function stylexMangleClassNames(
     generateBundle: {
       order: "post",
       handler(outputOptions, bundle) {
+        if (!hasCompleteRenderChunkGraph) {
+          for (const output of Object.values(bundle)) {
+            if (output.type !== "chunk") {
+              continue;
+            }
+
+            for (const renderedModule of Object.values(output.modules)) {
+              if (renderedModule.code === null) {
+                continue;
+              }
+
+              const discovered = findGeneratedClassNames(this, renderedModule.code);
+
+              for (const original of discovered.compiled) {
+                pendingCompiledClassNames.add(original);
+              }
+
+              for (const original of discovered.runtime) {
+                pendingRuntimeClassNames.add(original);
+              }
+            }
+          }
+
+          registerClassNames(
+            new Set([...pendingCompiledClassNames, ...pendingRuntimeClassNames]),
+          );
+
+          for (const output of Object.values(bundle)) {
+            if (output.type !== "chunk") {
+              continue;
+            }
+
+            const result = rewriteStylexClassNames(
+              output.code,
+              classNamePrefix,
+              classNames,
+            );
+
+            if (result.changed) {
+              output.code = rewriteChunkWithSourceMap(
+                bundle,
+                output,
+                output.code,
+                result.edits,
+              );
+            }
+          }
+        }
+
         const assets = textAssets(bundle);
         const cssSources = assets.filter(isCssAsset).map(({ source }) => source);
         const hasExtractedClasses = [...pendingCompiledClassNames].some(
@@ -609,9 +944,8 @@ export default function stylexMangleClassNames(
 
         finalizeOutputHashMarkers(
           bundle,
-          assets.filter(isCssAsset),
           outputOptions.hashCharacters ?? "base64",
-          cssHashMarkers,
+          assetHashMarkers,
           chunkHashMarkers,
         );
         cssAssetsFinalized = true;

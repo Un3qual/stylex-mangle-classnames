@@ -1,3 +1,4 @@
+import { posix } from "node:path";
 import { describe, expect, test } from "vitest";
 import { parseAst, type Plugin, type ResolvedConfig, type Rollup } from "vite";
 import { findStylexClassNamesInSelectors } from "../src/class-names.js";
@@ -28,6 +29,32 @@ function outputAsset(fileName: string, source: string): Rollup.OutputAsset {
     source,
     type: "asset",
   } as unknown as Rollup.OutputAsset;
+}
+
+function materializeHashPlaceholders(pattern: string, hash: string): string {
+  return pattern.replace(/\[hash(?::(\d+))?\]/g, (_placeholder, size: string | undefined) =>
+    hash.slice(0, size === undefined ? 8 : Number.parseInt(size, 10)),
+  );
+}
+
+function outputOptionsResult(
+  plugin: Plugin,
+  outputOptions: Rollup.OutputOptions,
+): Rollup.OutputOptions {
+  const hook = plugin.outputOptions;
+
+  if (!hook) {
+    throw new Error("Expected the plugin to define outputOptions");
+  }
+
+  const handler = typeof hook === "function" ? hook : hook.handler;
+  const result = handler.call({} as Rollup.PluginContext, outputOptions);
+
+  if (result instanceof Promise || !result) {
+    throw new Error("Expected synchronous output options");
+  }
+
+  return result;
 }
 
 function runGenerateBundle(plugin: Plugin, bundle: Rollup.OutputBundle): void {
@@ -239,8 +266,35 @@ describe("stylexMangleClassNames", () => {
       type: "asset",
     } as Rollup.PreRenderedAsset);
 
-    expect(fileName).toMatch(/^assets\/\[name\]-.{8}\[extname\]$/);
-    expect(fileName).not.toContain("[hash]");
+    expect(fileName).toMatch(
+      /^assets\/\[name\]-\[hash\]__STYLEX_HASH_[0-9a-z]+_[0-9a-z]+__\[extname\]$/,
+    );
+  });
+
+  test.each([1, 2, 3, 4])("preserves valid [hash:%i] output patterns", (length) => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const resolved = outputOptionsResult(plugin, {
+      assetFileNames: `assets/[name]-[hash:${length}][extname]`,
+      entryFileNames: `assets/[name]-[hash:${length}].js`,
+    });
+
+    const assetFileNames = resolved.assetFileNames;
+    const entryFileNames = resolved.entryFileNames;
+
+    if (typeof assetFileNames !== "function" || typeof entryFileNames !== "function") {
+      throw new Error("Expected filename callbacks");
+    }
+
+    expect(() =>
+      assetFileNames({
+        name: "stylex.css",
+        source: `.${PREFIX}1{color:red}`,
+        type: "asset",
+      } as Rollup.PreRenderedAsset),
+    ).not.toThrow();
+    expect(() =>
+      entryFileNames({ name: "entry" } as Rollup.PreRenderedChunk),
+    ).not.toThrow();
   });
 
   test("does not mark CSS assets emitted after its generateBundle hook", () => {
@@ -272,7 +326,7 @@ describe("stylexMangleClassNames", () => {
       type: "asset",
     } as Rollup.PreRenderedAsset;
 
-    expect(resolved.assetFileNames(cssAsset)).not.toContain("[hash]");
+    expect(resolved.assetFileNames(cssAsset)).toContain("__STYLEX_HASH_");
 
     const generateBundleHandler =
       typeof generateBundle === "function" ? generateBundle : generateBundle.handler;
@@ -288,6 +342,153 @@ describe("stylexMangleClassNames", () => {
     );
 
     expect(resolved.assetFileNames({ ...cssAsset })).toContain("[hash]");
+  });
+
+  test("starts hash finalization again for every Rollup output", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const cssAsset = {
+      name: "stylex.css",
+      source: `.${PREFIX}1{color:red}`,
+      type: "asset",
+    } as Rollup.PreRenderedAsset;
+
+    const first = outputOptionsResult(plugin, {
+      assetFileNames: "assets/[name]-[hash][extname]",
+    });
+
+    if (typeof first.assetFileNames !== "function") {
+      throw new Error("Expected an asset filename callback");
+    }
+
+    const firstPattern = first.assetFileNames(cssAsset);
+    expect(firstPattern).not.toBe("assets/[name]-[hash][extname]");
+
+    const generateBundle = plugin.generateBundle;
+
+    if (!generateBundle) {
+      throw new Error("Expected generateBundle");
+    }
+
+    const handler =
+      typeof generateBundle === "function" ? generateBundle : generateBundle.handler;
+    handler.call(
+      { error: (error: string): never => { throw new Error(error); } } as Rollup.PluginContext,
+      {} as Rollup.NormalizedOutputOptions,
+      {},
+      false,
+    );
+
+    const second = outputOptionsResult(plugin, {
+      assetFileNames: "assets/[name]-[hash][extname]",
+    });
+
+    if (typeof second.assetFileNames !== "function") {
+      throw new Error("Expected an asset filename callback");
+    }
+
+    expect(second.assetFileNames({ ...cssAsset })).not.toBe(
+      "assets/[name]-[hash][extname]",
+    );
+  });
+
+  test("renames bundle keys and filename-bearing chunk metadata together", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const resolved = outputOptionsResult(plugin, {
+      assetFileNames: "assets/[name]-[hash].css",
+      chunkFileNames: "assets/[name]-[hash].js",
+      entryFileNames: "assets/[name]-[hash].js",
+    });
+
+    if (
+      typeof resolved.assetFileNames !== "function" ||
+      typeof resolved.entryFileNames !== "function" ||
+      typeof resolved.chunkFileNames !== "function"
+    ) {
+      throw new Error("Expected filename callbacks");
+    }
+
+    const cssName = materializeHashPlaceholders(
+      resolved.assetFileNames({
+        name: "stylex.css",
+        source: `.${PREFIX}1{color:red}`,
+        type: "asset",
+      } as Rollup.PreRenderedAsset),
+      "csshash0",
+    ).replace("[name]", "stylex");
+    const dependencyName = materializeHashPlaceholders(
+      resolved.chunkFileNames({ name: "dependency" } as Rollup.PreRenderedChunk),
+      "dephash0",
+    ).replace("[name]", "dependency");
+    const entryName = materializeHashPlaceholders(
+      resolved.entryFileNames({ name: "entry" } as Rollup.PreRenderedChunk),
+      "entryhas",
+    ).replace("[name]", "entry");
+    const css = outputAsset(cssName, `.${PREFIX}1{color:red}`);
+    const dependency = outputChunk(`globalThis.className = "${PREFIX}1";`);
+    dependency.fileName = dependencyName;
+    const entry = outputChunk(`import "./${posix.basename(dependencyName)}";`);
+    entry.fileName = entryName;
+    entry.imports = [dependencyName];
+    entry.dynamicImports = [dependencyName];
+    const compatibleEntry = entry as Rollup.OutputChunk & {
+      implicitlyLoadedBefore: string[];
+      referencedFiles: string[];
+    };
+    compatibleEntry.implicitlyLoadedBefore = [dependencyName];
+    compatibleEntry.referencedFiles = [cssName];
+    const bundle: Rollup.OutputBundle = {
+      [cssName]: css,
+      [dependencyName]: dependency,
+      [entryName]: entry,
+    };
+
+    runGenerateBundle(plugin, bundle);
+
+    expect(Object.entries(bundle).every(([key, output]) => key === output.fileName)).toBe(
+      true,
+    );
+    expect(entry.imports).toEqual([dependency.fileName]);
+    expect(entry.dynamicImports).toEqual([dependency.fileName]);
+    expect(compatibleEntry.implicitlyLoadedBefore).toEqual([dependency.fileName]);
+    expect(compatibleEntry.referencedFiles).toEqual([css.fileName]);
+  });
+
+  test("rehashes every chunk in a circular dependency group", () => {
+    function finalize(firstSource: string): [string, string] {
+      const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+      const resolved = outputOptionsResult(plugin, {
+        chunkFileNames: "assets/[name]-[hash].js",
+      });
+
+      if (typeof resolved.chunkFileNames !== "function") {
+        throw new Error("Expected a chunk filename callback");
+      }
+
+      const firstName = materializeHashPlaceholders(
+        resolved.chunkFileNames({ name: "first" } as Rollup.PreRenderedChunk),
+        "first000",
+      ).replace("[name]", "first");
+      const secondName = materializeHashPlaceholders(
+        resolved.chunkFileNames({ name: "second" } as Rollup.PreRenderedChunk),
+        "second00",
+      ).replace("[name]", "second");
+      const first = outputChunk(`${firstSource};import "./${posix.basename(secondName)}";`);
+      first.fileName = firstName;
+      first.imports = [secondName];
+      const second = outputChunk(`import "./${posix.basename(firstName)}";`);
+      second.fileName = secondName;
+      second.imports = [firstName];
+      const bundle = { [firstName]: first, [secondName]: second };
+
+      runGenerateBundle(plugin, bundle);
+      return [first.fileName, second.fileName];
+    }
+
+    const before = finalize("globalThis.value = 1");
+    const after = finalize("globalThis.value = 2");
+
+    expect(after[0]).not.toBe(before[0]);
+    expect(after[1]).not.toBe(before[1]);
   });
 
   test("maps generated classes to a through z, then aa and ab", () => {
@@ -329,6 +530,45 @@ describe("stylexMangleClassNames", () => {
     expect(first.code.split("\n").at(-1)).toBe('globalThis.first = "b a";');
     expect(second.source).toBe(".a{color:red}.b:hover{color:blue}");
     expect(third.source).toBe('<main class="b a"></main>');
+  });
+
+  test("builds one mapping from all rendered chunks without renderChunk metadata", () => {
+    const first = outputChunk(
+      [
+        `inject({ ltr: ".${PREFIX}z{color:blue}" });`,
+        `globalThis.first = "${PREFIX}z";`,
+      ].join("\n"),
+    );
+    first.fileName = "first.js";
+    first.modules = {
+      "/first.js": {
+        code: first.code,
+        renderedExports: [],
+        renderedLength: first.code.length,
+      },
+    };
+    const second = outputChunk(
+      [
+        `inject({ ltr: ".${PREFIX}1{color:red}" });`,
+        `globalThis.second = "${PREFIX}1";`,
+      ].join("\n"),
+    );
+    second.fileName = "second.js";
+    second.modules = {
+      "/second.js": {
+        code: second.code,
+        renderedExports: [],
+        renderedLength: second.code.length,
+      },
+    };
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [first.fileName]: first,
+      [second.fileName]: second,
+    });
+
+    expect(first.code).toContain('globalThis.first = "b";');
+    expect(second.code).toContain('globalThis.second = "a";');
   });
 
   test("discovers extracted StyleX classes from matching selectors and references", () => {
@@ -471,7 +711,7 @@ describe("stylexMangleClassNames", () => {
         chunk.code,
         chunk,
         {} as Rollup.NormalizedOutputOptions,
-        {} as never,
+        { chunks: { [chunk.fileName]: chunk } } as never,
       ) as { code: string } | null;
 
       expect(result?.code).toBe('globalThis.className = "b a";');

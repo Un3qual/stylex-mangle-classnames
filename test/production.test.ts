@@ -338,10 +338,11 @@ async function buildWithExtractedCssSourceMap(
   };
 }
 
-async function buildWithCssReference(rule: string): Promise<{
+async function buildWithCssReference(rule: string, sourcemap = false): Promise<{
   cssFileName: string;
   javascript: string;
   javascriptFileName: string;
+  sourceMapFileName?: string;
 }> {
   const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
   const outDir = join(root, "dist");
@@ -353,9 +354,13 @@ async function buildWithCssReference(rule: string): Promise<{
       emptyOutDir: true,
       minify: false,
       outDir,
+      sourcemap,
       rollupOptions: {
         input: "virtual:entry",
-        output: { entryFileNames: "assets/[name]-[hash].js" },
+        output: {
+          entryFileNames: "assets/[name]-[hash].js",
+          sourcemapFileNames: "assets/[name]-[hash].map",
+        },
       },
     },
     configFile: false,
@@ -400,6 +405,7 @@ async function buildWithCssReference(rule: string): Promise<{
   const files = await readdir(assetsDirectory);
   const cssFileName = files.find((file) => file.endsWith(".css"));
   const javascriptFileName = files.find((file) => file.endsWith(".js"));
+  const sourceMapFileName = files.find((file) => file.endsWith(".map"));
 
   if (!cssFileName || !javascriptFileName) {
     throw new Error("Expected Vite to emit referenced CSS and JavaScript assets");
@@ -409,6 +415,7 @@ async function buildWithCssReference(rule: string): Promise<{
     cssFileName,
     javascript: await readFile(join(assetsDirectory, javascriptFileName), "utf8"),
     javascriptFileName,
+    sourceMapFileName,
   };
 }
 
@@ -734,6 +741,126 @@ async function buildHashedMain(includeExtraEntry: boolean): Promise<{
   };
 }
 
+async function buildAugmentedMain(augmentation: string): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+
+  await build({
+    build: {
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: {
+        input: "virtual:entry",
+        output: { entryFileNames: "assets/[name]-[hash].js" },
+      },
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      virtualEntry(),
+      {
+        name: "vary-chunk-hash-augmentation",
+        augmentChunkHash() {
+          return augmentation;
+        },
+      },
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+    ],
+  });
+
+  const fileName = (await readdir(join(outDir, "assets"))).find((file) =>
+    file.endsWith(".js"),
+  );
+
+  if (!fileName) {
+    throw new Error("Expected Vite to emit a JavaScript asset");
+  }
+
+  return fileName;
+}
+
+async function buildReferencedAssets(rule: string): Promise<{
+  binary: Uint8Array;
+  manifest: string;
+  manifestFileName: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+  let cssReferenceId: string;
+
+  await build({
+    build: {
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: {
+        input: "virtual:entry",
+        output: { assetFileNames: "assets/[name]-[hash][extname]" },
+      },
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      virtualExtractedEntry(),
+      {
+        name: "referenced-text-and-binary-assets",
+        buildStart() {
+          cssReferenceId = this.emitFile({
+            name: "stylex.css",
+            source: ".base{display:block}",
+            type: "asset",
+          });
+        },
+        generateBundle(_outputOptions, bundle) {
+          const cssFileName = this.getFileName(cssReferenceId);
+          const css = bundle[cssFileName];
+
+          if (css?.type !== "asset") {
+            throw new Error("Expected the emitted CSS asset");
+          }
+
+          css.source = `${css.source}${rule}`;
+          this.emitFile({
+            name: "precache.json",
+            source: JSON.stringify({ css: cssFileName }),
+            type: "asset",
+          });
+          this.emitFile({
+            name: "archive.bin",
+            source: new Uint8Array([
+              0xff,
+              ...Buffer.from(cssFileName),
+              0x80,
+            ]),
+            type: "asset",
+          });
+        },
+      },
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+    ],
+  });
+
+  const assetsDirectory = join(outDir, "assets");
+  const files = await readdir(assetsDirectory);
+  const manifestFileName = files.find((file) => file.endsWith(".json"));
+  const binaryFileName = files.find((file) => file.endsWith(".bin"));
+
+  if (!manifestFileName || !binaryFileName) {
+    throw new Error("Expected manifest and binary assets");
+  }
+
+  return {
+    binary: await readFile(join(assetsDirectory, binaryFileName)),
+    manifest: await readFile(join(assetsDirectory, manifestFileName), "utf8"),
+    manifestFileName,
+  };
+}
+
 describe("production output", () => {
   function lastLineLength(lines: readonly string[]): number {
     const line = lines.at(-1);
@@ -764,6 +891,13 @@ describe("production output", () => {
     expect(withExtra.fileName).not.toBe(withoutExtra.fileName);
   });
 
+  test("preserves other plugins' augmentChunkHash invalidation", async () => {
+    const first = await buildAugmentedMain("first");
+    const second = await buildAugmentedMain("second");
+
+    expect(second).not.toBe(first);
+  });
+
   test("includes cross-entry mapping changes in hashed CSS filenames", async () => {
     const withoutExtra = await buildHashedCss(false);
     const withExtra = await buildHashedCss(true);
@@ -789,6 +923,29 @@ describe("production output", () => {
     expect(red.cssFileName).not.toBe(blue.cssFileName);
     expect(red.javascript).not.toBe(blue.javascript);
     expect(red.javascriptFileName).not.toBe(blue.javascriptFileName);
+  });
+
+  test("rehashes source-map assets after finalizing referenced output filenames", async () => {
+    const red = await buildWithCssReference(`.${PREFIX}1{color:red}`, true);
+    const blue = await buildWithCssReference(`.${PREFIX}1{color:blue}`, true);
+
+    expect(red.sourceMapFileName).toBeDefined();
+    expect(blue.sourceMapFileName).not.toBe(red.sourceMapFileName);
+  });
+
+  test("rehashes text assets after finalizing referenced output filenames", async () => {
+    const red = await buildReferencedAssets(`.${PREFIX}1{color:red}`);
+    const blue = await buildReferencedAssets(`.${PREFIX}1{color:blue}`);
+
+    expect(red.manifest).not.toBe(blue.manifest);
+    expect(red.manifestFileName).not.toBe(blue.manifestFileName);
+  });
+
+  test("does not decode binary assets while finalizing output filenames", async () => {
+    const output = await buildReferencedAssets(`.${PREFIX}1{color:red}`);
+
+    expect(output.binary[0]).toBe(0xff);
+    expect(output.binary.at(-1)).toBe(0x80);
   });
 
   test("preserves authored text that resembles an internal hash marker", async () => {
