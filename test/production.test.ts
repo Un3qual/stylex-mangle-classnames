@@ -262,7 +262,9 @@ async function buildWithExtractedCss(): Promise<{
   };
 }
 
-async function buildWithExtractedCssSourceMap(): Promise<{
+async function buildWithExtractedCssSourceMap(
+  sourceMapSuffix = "",
+): Promise<{
   css: string;
   sourceMap: Record<string, unknown>;
 }> {
@@ -307,7 +309,7 @@ async function buildWithExtractedCssSourceMap(): Promise<{
         generateBundle() {
           this.emitFile({
             name: "stylex.css",
-            source: `${css}\n/*# sourceMappingURL=stylex.css.map */`,
+            source: `${css}\n/*# sourceMappingURL=stylex.css.map${sourceMapSuffix} */`,
             type: "asset",
           });
           this.emitFile({
@@ -333,6 +335,162 @@ async function buildWithExtractedCssSourceMap(): Promise<{
   return {
     css: await readFile(join(assetsDirectory, cssFile), "utf8"),
     sourceMap: JSON.parse(await readFile(join(assetsDirectory, mapFile), "utf8")),
+  };
+}
+
+async function buildWithCssReference(rule: string): Promise<{
+  cssFileName: string;
+  javascript: string;
+  javascriptFileName: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+  let cssReferenceId: string;
+
+  await build({
+    build: {
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: {
+        input: "virtual:entry",
+        output: { entryFileNames: "assets/[name]-[hash].js" },
+      },
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      {
+        name: "virtual-css-reference",
+        buildStart() {
+          cssReferenceId = this.emitFile({
+            name: "stylex.css",
+            source: ".base{display:block}",
+            type: "asset",
+          });
+        },
+        resolveId(id) {
+          return id === "virtual:entry" ? "/virtual-entry.js" : null;
+        },
+        load(id) {
+          return id === "/virtual-entry.js"
+            ? [
+                `globalThis.cssUrl = import.meta.ROLLUP_FILE_URL_${cssReferenceId};`,
+                `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+              ].join("\n")
+            : null;
+        },
+        generateBundle(_outputOptions, bundle) {
+          const output = bundle[this.getFileName(cssReferenceId)];
+
+          if (output?.type !== "asset") {
+            throw new Error("Expected the emitted CSS asset in generateBundle");
+          }
+
+          output.source = `${output.source}${rule}`;
+        },
+      },
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+    ],
+  });
+
+  const assetsDirectory = join(outDir, "assets");
+  const files = await readdir(assetsDirectory);
+  const cssFileName = files.find((file) => file.endsWith(".css"));
+  const javascriptFileName = files.find((file) => file.endsWith(".js"));
+
+  if (!cssFileName || !javascriptFileName) {
+    throw new Error("Expected Vite to emit referenced CSS and JavaScript assets");
+  }
+
+  return {
+    cssFileName,
+    javascript: await readFile(join(assetsDirectory, javascriptFileName), "utf8"),
+    javascriptFileName,
+  };
+}
+
+async function buildCssEmittedAfterMangler(): Promise<string[]> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+
+  await build({
+    build: {
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: { input: "virtual:entry" },
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      virtualEntry(),
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+      {
+        name: "late-post-css",
+        enforce: "post",
+        generateBundle() {
+          this.emitFile({ name: "late.css", source: ".late{color:red}", type: "asset" });
+        },
+      },
+    ],
+  });
+
+  return readdir(join(outDir, "assets"));
+}
+
+async function buildTreeShakenRuntimeRule(): Promise<{ css: string; javascript: string }> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+
+  await build({
+    build: {
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: { input: "virtual:entry" },
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      {
+        name: "virtual-tree-shaken-rule",
+        resolveId(id) {
+          return id === "virtual:entry" ? "/virtual-entry.js" : null;
+        },
+        load(id) {
+          return id === "/virtual-entry.js"
+            ? [
+                `if (false) inject({ ltr: ".${PREFIX}1{color:red}" });`,
+                `inject({ ltr: ".${PREFIX}z{color:blue}" });`,
+                `globalThis.className = "${PREFIX}z";`,
+              ].join("\n")
+            : null;
+        },
+      },
+      bundledCss(".base{color:black}"),
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+    ],
+  });
+
+  const assetsDirectory = join(outDir, "assets");
+  const files = await readdir(assetsDirectory);
+  const cssFile = files.find((file) => file.endsWith(".css"));
+  const javascriptFile = files.find((file) => file.endsWith(".js"));
+
+  if (!cssFile || !javascriptFile) {
+    throw new Error("Expected Vite to emit CSS and JavaScript assets");
+  }
+
+  return {
+    css: await readFile(join(assetsDirectory, cssFile), "utf8"),
+    javascript: await readFile(join(assetsDirectory, javascriptFile), "utf8"),
   };
 }
 
@@ -624,6 +782,37 @@ describe("production output", () => {
     expect(blue.fileName).not.toBe(red.fileName);
   });
 
+  test("rehashes JavaScript after finalizing a referenced CSS filename", async () => {
+    const red = await buildWithCssReference(`.${PREFIX}1{color:red}`);
+    const blue = await buildWithCssReference(`.${PREFIX}1{color:blue}`);
+
+    expect(red.cssFileName).not.toBe(blue.cssFileName);
+    expect(red.javascript).not.toBe(blue.javascript);
+    expect(red.javascriptFileName).not.toBe(blue.javascriptFileName);
+  });
+
+  test("preserves authored text that resembles an internal hash marker", async () => {
+    const marker = "_S0_____";
+    const output = await buildWithCss(`.${PREFIX}1{color:red};root{--label:"${marker}"}`);
+
+    expect(output.css).toContain(`--label:"${marker}"`);
+  });
+
+  test("leaves CSS emitted after the mangler with a real content hash", async () => {
+    const files = await buildCssEmittedAfterMangler();
+    const cssFile = files.find((file) => file.endsWith(".css"));
+
+    expect(cssFile).toBeDefined();
+    expect(cssFile).not.toContain("_S");
+  });
+
+  test("does not reserve class names from tree-shaken runtime rules", async () => {
+    const output = await buildTreeShakenRuntimeRule();
+
+    expect(output.css).toBe(".base{color:black}");
+    expect(output.javascript).toContain('globalThis.className = "a";');
+  });
+
   test("hashes CSS identified by a function-based asset filename pattern", async () => {
     const output: Rollup.OutputOptions = {
       assetFileNames: () => "assets/[name]-[hash].css",
@@ -760,6 +949,23 @@ describe("production output", () => {
     expect(originalPosition).toMatchObject({ column: 33, line: 1 });
     expect(originalPosition.source).toContain("style.css");
   });
+
+  test.each(["?v=42", "#styles"])(
+    "locates extracted CSS source maps with a %s URL suffix",
+    async (suffix) => {
+      const output = await buildWithExtractedCssSourceMap(suffix);
+      const generatedIndex = output.css.indexOf(".tail");
+      const generatedPrefix = output.css.slice(0, generatedIndex).split("\n");
+      const originalPosition = new SourceMapConsumer(
+        output.sourceMap as unknown as RawSourceMap,
+      ).originalPositionFor({
+        column: lastLineLength(generatedPrefix),
+        line: generatedPrefix.length,
+      });
+
+      expect(originalPosition).toMatchObject({ column: 33, line: 1 });
+    },
+  );
 
   test("rejects extracted output without a bundled CSS asset", async () => {
     await expect(buildExtractedWithoutCssAsset()).rejects.toThrow(

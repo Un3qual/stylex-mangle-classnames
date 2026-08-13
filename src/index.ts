@@ -28,7 +28,7 @@ type DiscoveredClassNames = {
 
 type HashCharacters = NonNullable<Rollup.OutputOptions["hashCharacters"]>;
 
-type CssHashMarker = {
+type HashMarker = {
   length: number;
   token: string;
 };
@@ -38,6 +38,10 @@ type CompatiblePreRenderedAsset = Rollup.PreRenderedAsset & {
   names?: readonly string[];
   originalFileName?: string;
   originalFileNames?: readonly string[];
+};
+
+type RenderChunkMeta = {
+  chunks?: Record<string, Rollup.RenderedChunk>;
 };
 
 const sourceMapDirectivePattern = /\/\*[#@]\s*sourceMappingURL=([^\s*]+)\s*\*\/\s*$/;
@@ -98,7 +102,7 @@ function contentHash(source: string, hashCharacters: HashCharacters): string {
 function markHashPlaceholders(
   pattern: string,
   markerId: number,
-  markers: Map<string, CssHashMarker>,
+  markers: Map<string, HashMarker>,
 ): string {
   return pattern.replace(/\[hash(?::(\d+))?\]/g, (_placeholder, size: string | undefined) => {
     const length = size === undefined ? 8 : Number.parseInt(size, 10);
@@ -126,16 +130,56 @@ function replaceHashMarkers(value: string, hashes: ReadonlyMap<string, string>):
   return result;
 }
 
+function replaceFileNameReferences(
+  value: string,
+  replacements: ReadonlyMap<string, string>,
+): string {
+  let result = value;
+
+  for (const [fileName, replacement] of replacements) {
+    result = result.replaceAll(fileName, replacement);
+  }
+
+  return result;
+}
+
+function fileNameReplacements(
+  outputs: readonly (readonly [string, Rollup.OutputChunk | Rollup.OutputAsset])[],
+  hashes: ReadonlyMap<string, string>,
+): Map<string, string> {
+  const replacements = new Map<string, string>();
+
+  for (const [, output] of outputs) {
+    const updatedFileName = replaceHashMarkers(output.fileName, hashes);
+
+    if (updatedFileName === output.fileName) {
+      continue;
+    }
+
+    replacements.set(output.fileName, updatedFileName);
+
+    const baseName = posix.basename(output.fileName);
+    const updatedBaseName = posix.basename(updatedFileName);
+
+    if (baseName !== output.fileName) {
+      replacements.set(baseName, updatedBaseName);
+    }
+  }
+
+  return replacements;
+}
+
 function sourceMapAsset(
   bundle: Rollup.OutputBundle,
   cssFileName: string,
   sourceMapUrl?: string,
 ): Rollup.OutputAsset | null {
+  const sourceMapPath = sourceMapUrl?.replace(/[?#].*$/, "");
   const fileName =
-    sourceMapUrl === undefined
+    sourceMapPath === undefined
       ? `${cssFileName}.map`
       : posix.normalize(
-          posix.join(posix.dirname(cssFileName), decodeURIComponent(sourceMapUrl)),
+          posix.join(posix.dirname(cssFileName), decodeURIComponent(sourceMapPath)),
         );
   const output = bundle[fileName];
 
@@ -191,11 +235,12 @@ function rewriteCssWithSourceMap(
   return rewrite.code;
 }
 
-function finalizeCssHashMarkers(
+function finalizeOutputHashMarkers(
   bundle: Rollup.OutputBundle,
   cssAssets: readonly TextAsset[],
   hashCharacters: HashCharacters,
-  markers: ReadonlyMap<string, CssHashMarker>,
+  cssMarkers: ReadonlyMap<string, HashMarker>,
+  chunkMarkers: ReadonlyMap<string, HashMarker>,
 ): void {
   const hashes = new Map<string, string>();
 
@@ -203,31 +248,100 @@ function finalizeCssHashMarkers(
     const source = assetSourceToString(output.source);
     let normalizedSource = source;
 
-    for (const { length, token } of markers.values()) {
+    for (const { length, token } of cssMarkers.values()) {
       normalizedSource = normalizedSource.replaceAll(token, "0".repeat(length));
     }
 
     const hash = contentHash(normalizedSource, hashCharacters);
 
-    for (const { length, token } of markers.values()) {
+    for (const { length, token } of cssMarkers.values()) {
       if (output.fileName.includes(token)) {
         hashes.set(token, hash.slice(0, length));
       }
     }
   }
 
-  if (hashes.size === 0) {
+  if (hashes.size === 0 && chunkMarkers.size === 0) {
     return;
   }
 
   const outputs = Object.entries(bundle);
+  const cssFileNameReplacements = fileNameReplacements(outputs, hashes);
+  const chunksByMarker = new Map<string, Rollup.OutputChunk>();
+
+  for (const [, output] of outputs) {
+    if (output.type !== "chunk") {
+      continue;
+    }
+
+    for (const { token } of chunkMarkers.values()) {
+      if (output.fileName.includes(token)) {
+        chunksByMarker.set(token, output);
+      }
+    }
+  }
+
+  const computingChunkHashes = new Set<string>();
+
+  function computeChunkHash(token: string): string {
+    const existing = hashes.get(token);
+
+    if (existing !== undefined) {
+      return existing;
+    }
+
+    const marker = chunkMarkers.get(token);
+    const output = chunksByMarker.get(token);
+
+    if (marker === undefined || output === undefined) {
+      return token;
+    }
+
+    if (computingChunkHashes.has(token)) {
+      return "0".repeat(marker.length);
+    }
+
+    computingChunkHashes.add(token);
+    let source = replaceFileNameReferences(output.code, cssFileNameReplacements);
+
+    for (const [dependencyToken, dependencyOutput] of chunksByMarker) {
+      if (!source.includes(dependencyToken)) {
+        continue;
+      }
+
+      const dependencyHash = computeChunkHash(dependencyToken);
+      const dependencyReplacements = fileNameReplacements(
+        [[dependencyOutput.fileName, dependencyOutput]],
+        new Map([[dependencyToken, dependencyHash]]),
+      );
+      source = replaceFileNameReferences(source, dependencyReplacements);
+    }
+
+    for (const { length, token: unresolvedToken } of chunkMarkers.values()) {
+      source = source.replaceAll(unresolvedToken, "0".repeat(length));
+    }
+
+    computingChunkHashes.delete(token);
+    const hash = contentHash(source, hashCharacters).slice(0, marker.length);
+    hashes.set(token, hash);
+    return hash;
+  }
+
+  for (const token of chunksByMarker.keys()) {
+    computeChunkHash(token);
+  }
+
+  const finalizedFileNameReplacements = fileNameReplacements(outputs, hashes);
 
   for (const [, output] of outputs) {
     if (output.type === "chunk") {
-      output.code = replaceHashMarkers(output.code, hashes);
+      output.code = replaceFileNameReferences(output.code, finalizedFileNameReplacements);
     } else {
       const source = assetSourceToString(output.source);
-      const updatedSource = replaceHashMarkers(source, hashes);
+      const updatedSource = replaceFileNameReferences(
+        source,
+        finalizedFileNameReplacements,
+      );
 
       if (updatedSource !== source) {
         output.source = updatedSource;
@@ -236,9 +350,9 @@ function finalizeCssHashMarkers(
   }
 
   for (const [, output] of outputs) {
-    const updatedFileName = replaceHashMarkers(output.fileName, hashes);
+    const updatedFileName = finalizedFileNameReplacements.get(output.fileName);
 
-    if (updatedFileName === output.fileName) {
+    if (updatedFileName === undefined) {
       continue;
     }
 
@@ -280,12 +394,14 @@ export default function stylexMangleClassNames(
   const generatedNames = new Map<string, string>();
   const pendingCompiledClassNames = new Set<string>();
   const pendingRuntimeClassNames = new Set<string>();
-  const discoveredClassNamesByModule = new Map<string, DiscoveredClassNames>();
   let command: ResolvedConfig["command"] = "build";
   let buildEmitsAssets = true;
   let assetHashMarkerIds = new WeakMap<object, number>();
-  const cssHashMarkers = new Map<string, CssHashMarker>();
-  let nextAssetHashMarkerId = 0;
+  let chunkHashMarkerIds = new WeakMap<object, number>();
+  const cssHashMarkers = new Map<string, HashMarker>();
+  const chunkHashMarkers = new Map<string, HashMarker>();
+  let nextHashMarkerId = 0;
+  let cssAssetsFinalized = false;
 
   function rememberClassName(original: string): void {
     const mangled = mangleStylexClassName(original, classNamePrefix, classNames);
@@ -338,11 +454,14 @@ export default function stylexMangleClassNames(
       generatedNames.clear();
       pendingCompiledClassNames.clear();
       pendingRuntimeClassNames.clear();
+      cssAssetsFinalized = false;
     },
     closeBundle() {
       assetHashMarkerIds = new WeakMap<object, number>();
+      chunkHashMarkerIds = new WeakMap<object, number>();
       cssHashMarkers.clear();
-      nextAssetHashMarkerId = 0;
+      chunkHashMarkers.clear();
+      nextHashMarkerId = 0;
     },
     configResolved(config) {
       command = config.command;
@@ -352,23 +471,55 @@ export default function stylexMangleClassNames(
     outputOptions(outputOptions) {
       const assetFileNames =
         outputOptions.assetFileNames ?? "assets/[name]-[hash][extname]";
+      const entryFileNames = outputOptions.entryFileNames;
+      const chunkFileNames = outputOptions.chunkFileNames;
+
+      function markedChunkFileName(
+        pattern: string | ((chunk: Rollup.PreRenderedChunk) => string),
+        chunk: Rollup.PreRenderedChunk,
+      ): string {
+        const resolvedPattern =
+          typeof pattern === "function" ? pattern(chunk) : pattern;
+        let markerId = chunkHashMarkerIds.get(chunk);
+
+        if (markerId === undefined) {
+          markerId = nextHashMarkerId;
+          nextHashMarkerId += 1;
+          chunkHashMarkerIds.set(chunk, markerId);
+        }
+
+        return markHashPlaceholders(resolvedPattern, markerId, chunkHashMarkers);
+      }
+
       return {
         ...outputOptions,
+        ...(entryFileNames === undefined
+          ? {}
+          : {
+              entryFileNames: (chunk: Rollup.PreRenderedChunk) =>
+                markedChunkFileName(entryFileNames, chunk),
+            }),
+        ...(chunkFileNames === undefined
+          ? {}
+          : {
+              chunkFileNames: (chunk: Rollup.PreRenderedChunk) =>
+                markedChunkFileName(chunkFileNames, chunk),
+            }),
         assetFileNames(asset) {
           const pattern =
             typeof assetFileNames === "function"
               ? assetFileNames(asset)
               : assetFileNames;
 
-          if (!isCssPreRenderedAsset(asset, pattern)) {
+          if (cssAssetsFinalized || !isCssPreRenderedAsset(asset, pattern)) {
             return pattern;
           }
 
           let markerId = assetHashMarkerIds.get(asset);
 
           if (markerId === undefined) {
-            markerId = nextAssetHashMarkerId;
-            nextAssetHashMarkerId += 1;
+            markerId = nextHashMarkerId;
+            nextHashMarkerId += 1;
             assetHashMarkerIds.set(asset, markerId);
           }
 
@@ -389,32 +540,27 @@ export default function stylexMangleClassNames(
       const result = rewriteStylexClassNames(code, classNamePrefix, classNames);
       return result.changed ? { code: result.code, map: null } : null;
     },
-    moduleParsed(moduleInfo) {
-      if (command !== "build") {
-        return;
-      }
-
-      discoveredClassNamesByModule.delete(moduleInfo.id);
-
-      if (moduleInfo.code === null || !isJavaScriptModule(moduleInfo.id)) {
-        return;
-      }
-
-      discoveredClassNamesByModule.set(
-        moduleInfo.id,
-        findGeneratedClassNames(this, moduleInfo.code),
-      );
-    },
     renderStart() {
+      cssAssetsFinalized = false;
       pendingCompiledClassNames.clear();
       pendingRuntimeClassNames.clear();
+    },
+    renderChunk(code, chunk, _outputOptions, meta?: RenderChunkMeta) {
+      const renderedChunks = meta?.chunks
+        ? Object.values(meta.chunks)
+        : [chunk];
+      const renderedSources = new Set<string>();
 
-      for (const moduleId of this.getModuleIds()) {
-        const discovered = discoveredClassNamesByModule.get(moduleId);
-
-        if (discovered === undefined) {
-          continue;
+      for (const renderedChunk of renderedChunks) {
+        for (const renderedModule of Object.values(renderedChunk.modules)) {
+          if (renderedModule.code !== null) {
+            renderedSources.add(renderedModule.code);
+          }
         }
+      }
+
+      for (const source of renderedSources) {
+        const discovered = findGeneratedClassNames(this, source);
 
         for (const original of discovered.compiled) {
           pendingCompiledClassNames.add(original);
@@ -428,8 +574,6 @@ export default function stylexMangleClassNames(
       registerClassNames(
         new Set([...pendingCompiledClassNames, ...pendingRuntimeClassNames]),
       );
-    },
-    renderChunk(code, chunk) {
       const result = rewriteStylexClassNames(code, classNamePrefix, classNames);
 
       return result.changed
@@ -463,12 +607,14 @@ export default function stylexMangleClassNames(
           }
         }
 
-        finalizeCssHashMarkers(
+        finalizeOutputHashMarkers(
           bundle,
           assets.filter(isCssAsset),
           outputOptions.hashCharacters ?? "base64",
           cssHashMarkers,
+          chunkHashMarkers,
         );
+        cssAssetsFinalized = true;
       },
     },
   };
