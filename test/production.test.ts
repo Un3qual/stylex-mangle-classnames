@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SourceMapConsumer, type RawSourceMap } from "source-map-js";
 import { afterEach, describe, expect, test } from "vitest";
-import { build, type Plugin } from "vite";
+import { build, type Plugin, type Rollup } from "vite";
 import stylexMangleClassNames from "../src/index.js";
 
 const PREFIX = "sx";
@@ -81,11 +81,11 @@ function inputMapWithoutSourceContent(): Plugin {
   };
 }
 
-function bundledCss(source: string): Plugin {
+function bundledCss(source: string, name = "stylex.css"): Plugin {
   return {
     name: "bundled-stylex-css",
     generateBundle() {
-      this.emitFile({ name: "stylex.css", source, type: "asset" });
+      this.emitFile({ name, source, type: "asset" });
     },
   };
 }
@@ -261,7 +261,11 @@ async function buildExtractedWithoutCssAsset(ssr = false): Promise<void> {
   });
 }
 
-async function buildHashedCss(includeExtraEntry: boolean): Promise<{
+async function buildHashedCss(
+  includeExtraEntry: boolean,
+  output?: Rollup.OutputOptions,
+  assetName?: string,
+): Promise<{
   contents: string;
   fileName: string;
 }> {
@@ -278,6 +282,7 @@ async function buildHashedCss(includeExtraEntry: boolean): Promise<{
         input: includeExtraEntry
           ? { extra: "virtual:extra", main: "virtual:main" }
           : { main: "virtual:main" },
+        output,
       },
     },
     configFile: false,
@@ -302,7 +307,7 @@ async function buildHashedCss(includeExtraEntry: boolean): Promise<{
             : null;
         },
       },
-      bundledCss(`.${PREFIX}z{color:blue}`),
+      bundledCss(`.${PREFIX}z{color:blue}`, assetName),
       stylexMangleClassNames({ classNamePrefix: PREFIX }),
     ],
   });
@@ -473,6 +478,34 @@ describe("production output", () => {
     expect(withExtra.contents).toBe(".b{color:blue}");
     expect(withExtra.fileName).not.toBe(withoutExtra.fileName);
   });
+
+  test("hashes CSS identified by a function-based asset filename pattern", async () => {
+    const output: Rollup.OutputOptions = {
+      assetFileNames: () => "assets/[name]-[hash].css",
+    };
+    const withoutExtra = await buildHashedCss(false, output, "stylex");
+    const withExtra = await buildHashedCss(true, output, "stylex");
+
+    expect(withoutExtra.contents).toBe(".a{color:blue}");
+    expect(withExtra.contents).toBe(".b{color:blue}");
+    expect(withExtra.fileName).not.toBe(withoutExtra.fileName);
+  });
+
+  test.each([
+    { alphabet: /^[0-9a-f]+$/, hashCharacters: "hex" as const },
+    { alphabet: /^[0-9a-z]+$/, hashCharacters: "base36" as const },
+  ])(
+    "uses the configured $hashCharacters alphabet for rewritten CSS hashes",
+    async ({ alphabet, hashCharacters }) => {
+      const output = await buildHashedCss(false, {
+        assetFileNames: "assets/[name]-[hash:12][extname]",
+        hashCharacters,
+      });
+      const hash = output.fileName.match(/-([^.]+)\.css$/)?.[1];
+
+      expect(hash).toMatch(alphabet);
+    },
+  );
 
   test("rewrites StyleX CSS emitted in the output bundle", async () => {
     const output = await buildWithCss(`.${PREFIX}1{color:red}`);

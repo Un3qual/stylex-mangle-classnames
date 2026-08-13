@@ -19,6 +19,13 @@ type TextAsset = {
   source: string;
 };
 
+type DiscoveredClassNames = {
+  compiled: Set<string>;
+  runtime: Set<string>;
+};
+
+type HashCharacters = NonNullable<Rollup.OutputOptions["hashCharacters"]>;
+
 function assetSourceToString(source: string | Uint8Array): string {
   return typeof source === "string" ? source : new TextDecoder().decode(source);
 }
@@ -40,14 +47,40 @@ function isCssAsset({ output }: TextAsset): boolean {
   return output.fileName.endsWith(".css");
 }
 
-function isCssPreRenderedAsset(asset: Rollup.PreRenderedAsset): boolean {
-  return [...asset.names, ...asset.originalFileNames].some((name) => name.endsWith(".css"));
+function isCssPreRenderedAsset(
+  asset: Rollup.PreRenderedAsset,
+  pattern: string,
+): boolean {
+  return (
+    pattern.endsWith(".css") ||
+    [...asset.names, ...asset.originalFileNames].some((name) => name.endsWith(".css"))
+  );
 }
 
-function replaceHashPlaceholders(pattern: string, source: string): string {
+function contentHash(source: string, hashCharacters: HashCharacters): string {
+  const digest = createHash("sha256").update(source).digest();
+
+  if (hashCharacters === "hex") {
+    return digest.toString("hex");
+  }
+
+  if (hashCharacters === "base36") {
+    return BigInt(`0x${digest.toString("hex")}`).toString(36).padStart(50, "0");
+  }
+
+  return digest.toString("base64url");
+}
+
+function replaceHashPlaceholders(
+  pattern: string,
+  source: string,
+  hashCharacters: HashCharacters,
+): string {
+  const hash = contentHash(source, hashCharacters);
+
   return pattern.replace(/\[hash(?::(\d+))?\]/g, (_placeholder, size: string | undefined) => {
     const length = size === undefined ? 8 : Number.parseInt(size, 10);
-    return createHash("sha256").update(source).digest("base64url").slice(0, length);
+    return hash.slice(0, length);
   });
 }
 
@@ -85,6 +118,7 @@ export default function stylexMangleClassNames(
   const generatedNames = new Map<string, string>();
   const pendingCompiledClassNames = new Set<string>();
   const pendingRuntimeClassNames = new Set<string>();
+  const discoveredClassNamesByModule = new Map<string, DiscoveredClassNames>();
   let command: ResolvedConfig["command"] = "build";
   let buildEmitsAssets = true;
 
@@ -105,7 +139,7 @@ export default function stylexMangleClassNames(
   function findGeneratedClassNames(
     context: Pick<Rollup.PluginContext, "parse">,
     source: string,
-  ): { compiled: Set<string>; runtime: Set<string> } {
+  ): DiscoveredClassNames {
     return {
       compiled: findStylexClassNamesInCompiledObjects(context.parse(source), classNamePrefix),
       runtime: findStylexClassNamesInRules(source, classNamePrefix),
@@ -148,6 +182,7 @@ export default function stylexMangleClassNames(
     outputOptions(outputOptions) {
       const assetFileNames =
         outputOptions.assetFileNames ?? "assets/[name]-[hash][extname]";
+      const hashCharacters = outputOptions.hashCharacters ?? "base64";
 
       return {
         ...outputOptions,
@@ -157,7 +192,7 @@ export default function stylexMangleClassNames(
               ? assetFileNames(asset)
               : assetFileNames;
 
-          if (!isCssPreRenderedAsset(asset)) {
+          if (!isCssPreRenderedAsset(asset, pattern)) {
             return pattern;
           }
 
@@ -165,7 +200,7 @@ export default function stylexMangleClassNames(
           const result = rewriteStylexClassNames(source, classNamePrefix, classNames);
 
           return result.changed
-            ? replaceHashPlaceholders(pattern, result.code)
+            ? replaceHashPlaceholders(pattern, result.code, hashCharacters)
             : pattern;
         },
       };
@@ -185,25 +220,41 @@ export default function stylexMangleClassNames(
       return result.changed ? { code: result.code, map: null } : null;
     },
     moduleParsed(moduleInfo) {
-      if (
-        command !== "build" ||
-        moduleInfo.code === null ||
-        !isJavaScriptModule(moduleInfo.id)
-      ) {
+      if (command !== "build") {
         return;
       }
 
-      const discovered = findGeneratedClassNames(this, moduleInfo.code);
+      discoveredClassNamesByModule.delete(moduleInfo.id);
 
-      for (const original of discovered.compiled) {
-        pendingCompiledClassNames.add(original);
+      if (moduleInfo.code === null || !isJavaScriptModule(moduleInfo.id)) {
+        return;
       }
 
-      for (const original of discovered.runtime) {
-        pendingRuntimeClassNames.add(original);
-      }
+      discoveredClassNamesByModule.set(
+        moduleInfo.id,
+        findGeneratedClassNames(this, moduleInfo.code),
+      );
     },
     renderStart() {
+      pendingCompiledClassNames.clear();
+      pendingRuntimeClassNames.clear();
+
+      for (const moduleId of this.getModuleIds()) {
+        const discovered = discoveredClassNamesByModule.get(moduleId);
+
+        if (discovered === undefined) {
+          continue;
+        }
+
+        for (const original of discovered.compiled) {
+          pendingCompiledClassNames.add(original);
+        }
+
+        for (const original of discovered.runtime) {
+          pendingRuntimeClassNames.add(original);
+        }
+      }
+
       registerClassNames(
         new Set([...pendingCompiledClassNames, ...pendingRuntimeClassNames]),
       );

@@ -23,10 +23,14 @@ function outputAsset(fileName: string, source: string): Rollup.OutputAsset {
 }
 
 function runGenerateBundle(plugin: Plugin, bundle: Rollup.OutputBundle): void {
+  const moduleIds = Object.values(bundle)
+    .filter((output): output is Rollup.OutputChunk => output.type === "chunk")
+    .map((output) => output.fileName);
   const context = {
     error(error: Rollup.RollupError | string): never {
       throw new Error(typeof error === "string" ? error : error.message);
     },
+    getModuleIds: () => moduleIds.values(),
     parse: parseAst,
   } as unknown as Rollup.PluginContext;
   const buildStart = plugin.buildStart;
@@ -335,9 +339,13 @@ describe("stylexMangleClassNames", () => {
     expect(css.source).toBe(".a{color:red}");
   });
 
-  test("collects generated classes from moduleParsed for cached build modules", () => {
+  test("preserves cached module discovery across watch rebuilds", () => {
     const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
-    const context = { parse: parseAst } as unknown as Rollup.PluginContext;
+    const moduleIds = ["/cached-runtime.js", "/changed-extracted.js"];
+    const context = {
+      getModuleIds: () => moduleIds.values(),
+      parse: parseAst,
+    } as unknown as Rollup.PluginContext;
     const buildStart = plugin.buildStart;
     const moduleParsed = plugin.moduleParsed;
     const renderStart = plugin.renderStart;
@@ -363,10 +371,12 @@ describe("stylexMangleClassNames", () => {
     for (let buildNumber = 0; buildNumber < 2; buildNumber += 1) {
       buildStartHandler.call(context, {} as Rollup.NormalizedInputOptions);
 
-      for (const [index, code] of sources.entries()) {
+      const parsedModuleIndexes = buildNumber === 0 ? [0, 1] : [1];
+
+      for (const index of parsedModuleIndexes) {
         moduleParsedHandler.call(context, {
-          code,
-          id: `/cached-${index}.js`,
+          code: sources[index],
+          id: moduleIds[index],
         } as Rollup.ModuleInfo);
       }
 
