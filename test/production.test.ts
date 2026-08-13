@@ -34,6 +34,23 @@ function virtualEntry(): Plugin {
   };
 }
 
+function virtualExtractedEntry(): Plugin {
+  return {
+    name: "virtual-extracted-entry",
+    resolveId(id) {
+      return id === "virtual:entry" ? "/virtual-entry.js" : null;
+    },
+    load(id) {
+      return id === "/virtual-entry.js"
+        ? [
+            `globalThis.className = "${PREFIX}1";`,
+            `globalThis.values = ["${PREFIX}1", globalThis.afterValue];`,
+          ].join("\n")
+        : null;
+    },
+  };
+}
+
 function lateCss(source: string): Plugin {
   return {
     name: "late-stylex-css",
@@ -140,6 +157,49 @@ async function buildWithSourceMap(sourcemap: SourceMapMode): Promise<{
   };
 }
 
+async function buildWithLateExtractedCss(): Promise<{
+  css: string;
+  javascript: string;
+  sourceMap: Record<string, unknown>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
+  const outDir = join(root, "dist");
+  temporaryDirectories.push(root);
+
+  await build({
+    build: {
+      emptyOutDir: true,
+      minify: false,
+      outDir,
+      rollupOptions: { input: "virtual:entry" },
+      sourcemap: true,
+    },
+    configFile: false,
+    envFile: false,
+    logLevel: "silent",
+    plugins: [
+      virtualExtractedEntry(),
+      lateCss(`.${PREFIX}1{color:red}`),
+      stylexMangleClassNames({ classNamePrefix: PREFIX }),
+    ],
+  });
+
+  const assetsDirectory = join(outDir, "assets");
+  const files = await readdir(assetsDirectory);
+  const javascriptFile = files.find((file) => file.endsWith(".js"));
+  const mapFile = files.find((file) => file.endsWith(".js.map"));
+
+  if (!javascriptFile || !mapFile) {
+    throw new Error("Expected Vite to emit JavaScript and its source map");
+  }
+
+  return {
+    css: await readFile(join(assetsDirectory, "stylex.css"), "utf8"),
+    javascript: await readFile(join(assetsDirectory, javascriptFile), "utf8"),
+    sourceMap: JSON.parse(await readFile(join(assetsDirectory, mapFile), "utf8")),
+  };
+}
+
 describe("production output", () => {
   test("rewrites StyleX CSS emitted by an earlier writeBundle hook", async () => {
     const output = await buildWithLateCss(`.${PREFIX}1{color:red}`);
@@ -190,4 +250,23 @@ describe("production output", () => {
       expect(originalPosition.source).toContain("virtual-entry.js");
     },
   );
+
+  test("rewrites JavaScript and its source map when StyleX CSS is emitted late", async () => {
+    const output = await buildWithLateExtractedCss();
+
+    expect(output.css).toBe(".a{color:red}");
+    expect(output.javascript).toContain('globalThis.className = "a";');
+    expect(output.javascript).toContain('["a", globalThis.afterValue]');
+
+    const generatedIndex = output.javascript.indexOf("globalThis.afterValue");
+    const generatedPrefix = output.javascript.slice(0, generatedIndex).split("\n");
+    const originalPosition = new SourceMapConsumer(output.sourceMap as unknown as RawSourceMap)
+      .originalPositionFor({
+        column: generatedPrefix.at(-1)!.length,
+        line: generatedPrefix.length,
+      });
+
+    expect(originalPosition).toMatchObject({ column: 28, line: 2 });
+    expect(originalPosition.source).toContain("virtual-entry.js");
+  });
 });

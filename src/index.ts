@@ -8,7 +8,11 @@ import {
   mangleStylexClassName,
   rewriteStylexClassNames,
 } from "./class-names.js";
-import { rewriteWithSourceMap } from "./source-maps.js";
+import {
+  inlineSourceMap,
+  replaceInlineSourceMap,
+  rewriteWithSourceMap,
+} from "./source-maps.js";
 
 export type StylexMangleClassNamesOptions = {
   /** Must exactly match the classNamePrefix passed to the StyleX compiler. */
@@ -17,6 +21,12 @@ export type StylexMangleClassNamesOptions = {
 
 type TextOutput = {
   output: Rollup.OutputAsset | Rollup.OutputChunk;
+  source: string;
+};
+
+type TextFile = {
+  fileName: string;
+  output: Rollup.OutputAsset | Rollup.OutputChunk | null;
   source: string;
 };
 
@@ -71,12 +81,7 @@ function updateSourceMapOutput(
     return;
   }
 
-  const inlineMapPattern =
-    /sourceMappingURL=data:application\/json;charset=utf-8;base64,[A-Za-z0-9+/=]+/;
-
-  if (inlineMapPattern.test(output.code)) {
-    output.code = output.code.replace(inlineMapPattern, `sourceMappingURL=${map.toUrl()}`);
-  }
+  output.code = replaceInlineSourceMap(output.code, map);
 }
 
 function assertValidPrefix(classNamePrefix: string): void {
@@ -154,8 +159,6 @@ export default function stylexMangleClassNames(
 
   function registerClassNamesFromOutputs(outputs: readonly TextOutput[]): void {
     const originals = new Set<string>();
-    const selectors = new Set<string>();
-    const references = new Set<string>();
 
     for (const { source } of outputs) {
       for (const original of findStylexClassNamesInRules(source, classNamePrefix)) {
@@ -163,13 +166,28 @@ export default function stylexMangleClassNames(
       }
     }
 
-    for (const { source } of outputs.filter(isCssOutput)) {
+    registerClassNames(originals);
+    registerExtractedClassNames(
+      outputs.filter(isCssOutput).map(({ source }) => source),
+      outputs.filter((output) => !isCssOutput(output)).map(({ source }) => source),
+    );
+  }
+
+  function registerExtractedClassNames(
+    cssSources: readonly string[],
+    referenceSources: readonly string[],
+  ): void {
+    const originals = new Set<string>();
+    const selectors = new Set<string>();
+    const references = new Set<string>();
+
+    for (const source of cssSources) {
       for (const selector of findStylexClassNamesInSelectors(source, classNamePrefix)) {
         selectors.add(selector);
       }
     }
 
-    for (const { source } of outputs.filter((output) => !isCssOutput(output))) {
+    for (const source of referenceSources) {
       for (const reference of findStylexClassNameReferences(source, classNamePrefix)) {
         references.add(reference);
       }
@@ -187,10 +205,11 @@ export default function stylexMangleClassNames(
   function assertNoAuthoredCssCollisions(
     context: Rollup.PluginContext,
     sources: readonly string[],
+    names: ReadonlyMap<string, string> = generatedNames,
   ): void {
     for (const source of sources) {
       for (const className of authoredCssClasses(source)) {
-        const original = generatedNames.get(className);
+        const original = names.get(className);
 
         if (original !== undefined) {
           context.error(collisionMessage(className, original));
@@ -247,31 +266,103 @@ export default function stylexMangleClassNames(
       return;
     }
 
-    const bundledCssFiles = new Set(
-      Object.values(bundle)
-        .filter((output) => output.type === "asset" && output.fileName.endsWith(".css"))
-        .map((output) => resolve(directory, output.fileName)),
+    const bundledFiles = await Promise.all(
+      textOutputs(bundle).map(async ({ output }) => {
+        const fileName = resolve(directory, output.fileName);
+
+        return {
+          fileName,
+          output,
+          source: await readFile(fileName, "utf8"),
+        } satisfies TextFile;
+      }),
     );
-    const fileNames = (await cssFilesIn(directory)).filter(
-      (fileName) => !bundledCssFiles.has(fileName),
+    const bundledCssFileNames = new Set(
+      bundledFiles
+        .filter(({ output }) => output.type === "asset" && output.fileName.endsWith(".css"))
+        .map(({ fileName }) => fileName),
     );
-    const files = await Promise.all(
-      fileNames.map(async (fileName) => ({
-        fileName,
-        source: await readFile(fileName, "utf8"),
-      })),
+    const lateCssFiles = await Promise.all(
+      (await cssFilesIn(directory))
+        .filter((fileName) => !bundledCssFileNames.has(fileName))
+        .map(async (fileName): Promise<TextFile> => ({
+          fileName,
+          output: null,
+          source: await readFile(fileName, "utf8"),
+        })),
+    );
+    const generatedNamesBefore = new Set(generatedNames.keys());
+    const bundledCssFiles = bundledFiles.filter(
+      ({ output }) => output.type === "asset" && output.fileName.endsWith(".css"),
+    );
+    const referenceFiles = bundledFiles.filter(
+      ({ output }) => output.type === "chunk" || !output.fileName.endsWith(".css"),
+    );
+
+    registerExtractedClassNames(
+      [...bundledCssFiles, ...lateCssFiles].map(({ source }) => source),
+      referenceFiles.map(({ source }) => source),
+    );
+
+    const newlyGeneratedNames = new Map(
+      [...generatedNames].filter(([name]) => !generatedNamesBefore.has(name)),
     );
 
     assertNoAuthoredCssCollisions(
       context,
-      files.map((file) => file.source),
+      lateCssFiles.map((file) => file.source),
+    );
+    assertNoAuthoredCssCollisions(
+      context,
+      bundledCssFiles.map((file) => file.source),
+      newlyGeneratedNames,
     );
 
     await Promise.all(
-      files.map(async ({ fileName, source }) => {
+      [...bundledFiles, ...lateCssFiles].map(async ({ fileName, output, source }) => {
         const result = rewriteStylexClassNames(source, classNamePrefix, classNames);
 
-        if (result.changed) {
+        if (!result.changed) {
+          return;
+        }
+
+        if (output?.type !== "chunk") {
+          await writeFile(fileName, result.code, "utf8");
+          return;
+        }
+
+        if (output.sourcemapFileName) {
+          const mapFileName = resolve(directory, output.sourcemapFileName);
+          const inputMap = JSON.parse(await readFile(mapFileName, "utf8"));
+          const rewritten = rewriteWithSourceMap(
+            source,
+            output.fileName,
+            result.edits,
+            inputMap,
+          );
+
+          await Promise.all([
+            writeFile(fileName, rewritten.code, "utf8"),
+            writeFile(mapFileName, rewritten.map.toString(), "utf8"),
+          ]);
+          return;
+        }
+
+        const inputMap = inlineSourceMap(source);
+
+        if (inputMap) {
+          const rewritten = rewriteWithSourceMap(
+            source,
+            output.fileName,
+            result.edits,
+            inputMap,
+          );
+          await writeFile(
+            fileName,
+            replaceInlineSourceMap(rewritten.code, rewritten.map),
+            "utf8",
+          );
+        } else {
           await writeFile(fileName, result.code, "utf8");
         }
       }),

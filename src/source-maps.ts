@@ -11,6 +11,9 @@ export type SourceMappedRewrite = {
   map: Rollup.SourceMap;
 };
 
+const inlineSourceMapPattern =
+  /sourceMappingURL=data:application\/json;charset=utf-8;base64,([A-Za-z0-9+/=]+)/;
+
 const remapping = remappingModule as unknown as typeof import("@ampproject/remapping").default;
 
 function rollupSourceMap(map: RemappedSourceMap): Rollup.SourceMap {
@@ -35,11 +38,23 @@ function rollupSourceMap(map: RemappedSourceMap): Rollup.SourceMap {
   };
 }
 
+export function inlineSourceMap(source: string): SourceMapInput | null {
+  const encoded = source.match(inlineSourceMapPattern)?.[1];
+
+  return encoded
+    ? (JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as SourceMapInput)
+    : null;
+}
+
+export function replaceInlineSourceMap(source: string, map: Rollup.SourceMap): string {
+  return source.replace(inlineSourceMapPattern, `sourceMappingURL=${map.toUrl()}`);
+}
+
 export function rewriteWithSourceMap(
   source: string,
   fileName: string,
   edits: readonly StylexClassNameEdit[],
-  inputMap: Rollup.SourceMap,
+  inputMap: SourceMapInput | Rollup.SourceMap,
 ): SourceMappedRewrite {
   const rewritten = new MagicString(source);
 
@@ -54,7 +69,10 @@ export function rewriteWithSourceMap(
     source: fileName,
   });
   const map = remapping(
-    [JSON.parse(editMap.toString()) as SourceMapInput, inputMap as SourceMapInput],
+    [
+      JSON.parse(editMap.toString()) as SourceMapInput,
+      inputMap as unknown as SourceMapInput,
+    ],
     () => null,
   );
 
