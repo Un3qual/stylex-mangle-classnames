@@ -1,7 +1,5 @@
 # Contributing
 
-Thanks for helping improve `@un3qual/stylex-mangle-classnames`.
-
 ## Development setup
 
 Local development uses Node.js 20.19 or newer and pnpm 11.18.0 through Corepack:
@@ -12,7 +10,7 @@ pnpm install
 pnpm run check
 ```
 
-Fork the repository, create a focused branch, and keep each change limited to one clear concern. The plugin supports Node.js 18 for consumers because Vite 5 remains in its peer range; the newer local Node requirement comes from the current Vite development dependency.
+Fork the repository and create a branch for the change. Keep unrelated changes in separate pull requests. The package supports Node.js 18 for consumers because Vite 5 remains in its peer range; local development uses the newer Node version required by the current Vite development dependency.
 
 ## Tests
 
@@ -31,13 +29,13 @@ Review the package dry-run output for unintended files.
 
 Run `pnpm changeset` for user-visible fixes and features. Select the package, choose the semantic-version impact, and describe the outcome for users. Documentation, tests, CI, and repository-only maintenance do not require a changeset.
 
-Changesets do not publish this package automatically.
+Changesets record version and changelog changes. Publishing runs only after the release process below.
 
 ## Releases
 
 Publishing uses npm trusted publishing from `.github/workflows/publish.yml`. The repository does not store an npm publishing token.
 
-The publish job intentionally relies on `publishConfig.registry` instead of configuring `registry-url` in `actions/setup-node`. The latter writes a token-auth entry to npm's user configuration and prevents npm from initiating the trusted-publisher OIDC exchange when no `NODE_AUTH_TOKEN` exists.
+The publish job uses `publishConfig.registry` instead of `registry-url` in `actions/setup-node`. Configuring `registry-url` writes a token-auth entry to npm's user configuration and prevents npm from initiating the trusted-publisher OIDC exchange when no `NODE_AUTH_TOKEN` exists.
 
 Commit a Changeset with every user-visible change. When a release is ready:
 
