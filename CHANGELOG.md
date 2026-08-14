@@ -1,14 +1,25 @@
 # Changelog
 
+All notable changes to this project are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## Unreleased
+
+### Added
+
+- Accurate production JavaScript source maps for Vite's external, hidden, and inline modes.
+- Class-selector collision detection for Rollup-emitted CSS rules.
+
+### Changed
+
+- JavaScript class names are rewritten before Vite calculates chunk hashes.
+- Vite 8 is the supported peer version.
+- Runtime-injected StyleX output is the supported compilation mode.
+
 ## 0.1.1
 
 ### Patch Changes
 
 - 5d9c638: Discover generated class names from emitted StyleX rules so prefix-shaped application data and authored CSS are not rewritten.
-
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## 0.1.0 - 2026-08-12
 

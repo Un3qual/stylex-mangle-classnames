@@ -4,6 +4,13 @@ const CSS_IDENTIFIER_CHARACTER = "A-Za-z0-9_-";
 export type StylexRewriteResult = {
   changed: boolean;
   code: string;
+  edits: StylexClassNameEdit[];
+};
+
+export type StylexClassNameEdit = {
+  end: number;
+  replacement: string;
+  start: number;
 };
 
 function escapeRegularExpression(value: string): string {
@@ -22,7 +29,10 @@ function atomicClassPattern(classNamePrefix: string): RegExp {
 function atomicClassSelectorPattern(classNamePrefix: string): RegExp {
   const prefix = escapeRegularExpression(classNamePrefix);
 
-  return new RegExp(`\\.(${prefix}(?:0|[1-9a-z][0-9a-z]*))(?![${CSS_IDENTIFIER_CHARACTER}])`, "g");
+  return new RegExp(
+    `\\.(${prefix}(?:0|[1-9a-z][0-9a-z]*))(?![${CSS_IDENTIFIER_CHARACTER}])`,
+    "g",
+  );
 }
 
 const stylexRulePattern = /\b(?:ltr|rtl)\s*:\s*(?:`([^`]*)`|"((?:\\.|[^"\\])*)")/g;
@@ -77,11 +87,16 @@ export function mangleStylexClassName(
   return mangled;
 }
 
-export function findStylexClassNamesInRules(source: string, classNamePrefix: string): Set<string> {
+export function findStylexClassNamesInRules(
+  source: string,
+  classNamePrefix: string,
+): Set<string> {
   const classNames = new Set<string>();
 
   for (const rule of findStylexRules(source)) {
-    for (const match of rule.matchAll(atomicClassSelectorPattern(classNamePrefix))) {
+    for (const match of rule.matchAll(
+      atomicClassSelectorPattern(classNamePrefix),
+    )) {
       classNames.add(match[1]!);
     }
   }
@@ -105,10 +120,11 @@ export function rewriteStylexClassNames(
   classNames: Map<string, string>,
 ): StylexRewriteResult {
   if (classNames.size === 0) {
-    return { changed: false, code: source };
+    return { changed: false, code: source, edits: [] };
   }
 
   let changed = false;
+  const edits: StylexClassNameEdit[] = [];
   const code = source.replace(
     atomicClassPattern(classNamePrefix),
     (match, boundary: string, className: string, offset: number) => {
@@ -125,9 +141,14 @@ export function rewriteStylexClassNames(
       }
 
       changed = true;
+      edits.push({
+        end: classNameOffset + className.length,
+        replacement: mangled,
+        start: classNameOffset,
+      });
       return `${boundary}${mangled}`;
     },
   );
 
-  return { changed, code };
+  return { changed, code, edits };
 }

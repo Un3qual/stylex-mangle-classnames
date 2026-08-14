@@ -1,6 +1,7 @@
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { SourceMapConsumer, type RawSourceMap } from "source-map-js";
 import { afterEach, describe, expect, test } from "vitest";
 import { build, type Plugin } from "vite";
 import stylexMangleClassNames from "../src/index.js";
@@ -14,39 +15,32 @@ afterEach(async () => {
   }
 });
 
-function virtualEntry(): Plugin {
+function virtualModules(modules: ReadonlyMap<string, string>): Plugin {
+  const resolved = new Map(
+    [...modules].map(([id, source]) => [
+      `/${id.replace(/[^A-Za-z0-9_-]/g, "-")}.js`,
+      source,
+    ]),
+  );
+
   return {
-    name: "virtual-entry",
+    name: "virtual-modules",
     resolveId(id) {
-      return id === "virtual:entry" ? "/virtual-entry.js" : null;
-    },
-    load(id) {
-      return id === "/virtual-entry.js"
-        ? [
-            `inject({ ltr: ".${PREFIX}1{color:red}" });`,
-            `globalThis.className = "${PREFIX}1";`,
-          ].join("\n")
+      return modules.has(id)
+        ? `/${id.replace(/[^A-Za-z0-9_-]/g, "-")}.js`
         : null;
     },
-  };
-}
-
-function lateCss(source: string): Plugin {
-  return {
-    name: "late-stylex-css",
-    async writeBundle(options) {
-      if (!options.dir) {
-        throw new Error("Expected Vite to configure an output directory");
-      }
-
-      const assetsDirectory = join(options.dir, "assets");
-      await mkdir(assetsDirectory, { recursive: true });
-      await writeFile(join(assetsDirectory, "stylex.css"), source, "utf8");
+    load(id) {
+      return resolved.get(id) ?? null;
     },
   };
 }
 
-async function buildWithLateCss(css: string): Promise<{ css: string; javascript: string }> {
+async function buildModules(
+  modules: ReadonlyMap<string, string>,
+  input: string | Record<string, string>,
+  sourcemap: boolean | "hidden" | "inline" = false,
+): Promise<{ files: Map<string, string>; outDir: string }> {
   const root = await mkdtemp(join(tmpdir(), "stylex-mangle-classnames-"));
   const outDir = join(root, "dist");
   temporaryDirectories.push(root);
@@ -56,42 +50,123 @@ async function buildWithLateCss(css: string): Promise<{ css: string; javascript:
       emptyOutDir: true,
       minify: false,
       outDir,
-      rollupOptions: { input: "virtual:entry" },
+      rollupOptions: { input },
+      sourcemap,
     },
     configFile: false,
     envFile: false,
     logLevel: "silent",
     plugins: [
-      virtualEntry(),
-      lateCss(css),
+      virtualModules(modules),
       stylexMangleClassNames({ classNamePrefix: PREFIX }),
     ],
   });
 
   const assetsDirectory = join(outDir, "assets");
-  const javascriptFile = (await readdir(assetsDirectory)).find((file) => file.endsWith(".js"));
+  const files = new Map<string, string>();
 
-  if (!javascriptFile) {
-    throw new Error("Expected Vite to emit a JavaScript asset");
+  for (const fileName of await readdir(assetsDirectory)) {
+    files.set(fileName, await readFile(join(assetsDirectory, fileName), "utf8"));
   }
 
+  return { files, outDir };
+}
+
+function generatedPosition(source: string, token: string): {
+  column: number;
+  line: number;
+} {
+  const offset = source.indexOf(token);
+  const before = source.slice(0, offset);
+  const lines = before.split("\n");
   return {
-    css: await readFile(join(assetsDirectory, "stylex.css"), "utf8"),
-    javascript: await readFile(join(assetsDirectory, javascriptFile), "utf8"),
+    column: lines.at(-1)?.length ?? 0,
+    line: lines.length,
   };
 }
 
 describe("production output", () => {
-  test("rewrites StyleX CSS emitted by an earlier writeBundle hook", async () => {
-    const output = await buildWithLateCss(`.${PREFIX}1{color:red}`);
+  test.each([true, "hidden", "inline"] as const)(
+    "preserves original positions with the %s source-map mode",
+    async (sourcemap) => {
+      const original = [
+        `inject({ ltr: ".${PREFIX}1{color:red}" });`,
+        `globalThis.className = "${PREFIX}1"; globalThis.marker = 123;`,
+      ].join("\n");
+      const { files } = await buildModules(
+        new Map([["virtual:entry", original]]),
+        "virtual:entry",
+        sourcemap,
+      );
+      const [javascriptName, javascript] =
+        [...files].find(([fileName]) => fileName.endsWith(".js")) ?? [];
 
-    expect(output.javascript).toContain('globalThis.className = "a";');
-    expect(output.css).toBe(".a{color:red}");
-  });
+      expect(javascriptName).toBeDefined();
+      expect(javascript).toContain('globalThis.className = "a";');
+      expect(javascript).toContain("globalThis.marker = 123;");
 
-  test("fails before rewriting late CSS that collides with an authored class", async () => {
-    await expect(buildWithLateCss(`.${PREFIX}1{color:red}.a{color:blue}`)).rejects.toThrow(
-      'generated class ".a" would collide with authored CSS',
+      const inlineMap = javascript?.match(
+        /sourceMappingURL=data:application\/json(?:;charset=[^;,]+)?;base64,([^\s]+)/,
+      )?.[1];
+      const externalMapName =
+        sourcemap === "hidden"
+          ? [...files.keys()].find((fileName) => fileName.endsWith(".js.map"))
+          : javascript?.match(/sourceMappingURL=([^\s]+)/)?.[1];
+      const serializedMap =
+        sourcemap === "inline"
+          ? Buffer.from(inlineMap ?? "", "base64").toString("utf8")
+          : files.get(externalMapName ?? "");
+
+      expect(serializedMap).toBeDefined();
+      expect(javascript?.includes("sourceMappingURL=")).toBe(sourcemap !== "hidden");
+
+      const consumer = new SourceMapConsumer(
+        JSON.parse(serializedMap ?? "") as RawSourceMap,
+      );
+      const position = consumer.originalPositionFor(
+        generatedPosition(javascript ?? "", "globalThis.marker"),
+      );
+      const markerLine = original.split("\n").at(1) ?? "";
+
+      expect(position).toMatchObject({
+        column: markerLine.indexOf("globalThis.marker"),
+        line: 2,
+      });
+      expect(position.source).toContain("virtual-entry.js");
+    },
+  );
+
+  test("includes the bundle-wide mapping in entry hashes", async () => {
+    const main = [
+      `inject({ ltr: ".${PREFIX}z{color:blue}" });`,
+      `globalThis.className = "${PREFIX}z";`,
+    ].join("\n");
+    const onlyMain = await buildModules(
+      new Map([["virtual:main", main]]),
+      { main: "virtual:main" },
+    );
+    const withIndependentEntry = await buildModules(
+      new Map([
+        ["virtual:main", main],
+        ["virtual:other", `inject({ ltr: ".${PREFIX}1{color:red}" });`],
+      ]),
+      { main: "virtual:main", other: "virtual:other" },
+    );
+    const firstMain = [...onlyMain.files.keys()].find(
+      (fileName) => fileName.startsWith("main-") && fileName.endsWith(".js"),
+    );
+    const secondMain = [...withIndependentEntry.files.keys()].find(
+      (fileName) => fileName.startsWith("main-") && fileName.endsWith(".js"),
+    );
+
+    expect(firstMain).toBeDefined();
+    expect(secondMain).toBeDefined();
+    expect(firstMain).not.toBe(secondMain);
+    expect(onlyMain.files.get(firstMain ?? "")).toContain(
+      'globalThis.className = "a";',
+    );
+    expect(withIndependentEntry.files.get(secondMain ?? "")).toContain(
+      'globalThis.className = "b";',
     );
   });
 });
