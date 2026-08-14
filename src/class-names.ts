@@ -8,7 +8,7 @@ import {
 } from "./html.js";
 
 const SHORT_CLASS_NAME_ALPHABET = "abcdefghijklmnopqrstuvwxyz";
-const CSS_IDENTIFIER_CHARACTER = String.raw`\p{ID_Continue}-`;
+const CSS_IDENTIFIER_CHARACTER = String.raw`\p{ID_Continue}\u0080-\u{10FFFF}-`;
 
 export type StylexRewriteResult = {
   changed: boolean;
@@ -89,7 +89,6 @@ function selectorClassReferences(selector: string): SelectorClassReference[] {
     if (
       node.attribute.toLowerCase() !== "class" ||
       node.namespace !== undefined ||
-      (node.operator !== "=" && node.operator !== "~=") ||
       node.value === undefined
     ) {
       return;
@@ -99,6 +98,26 @@ function selectorClassReferences(selector: string): SelectorClassReference[] {
     const normalize = insensitive
       ? (className: string) => className.toLowerCase()
       : (className: string) => className;
+
+    if (
+      node.operator === "^=" ||
+      node.operator === "$=" ||
+      node.operator === "*=" ||
+      node.operator === "|="
+    ) {
+      references.push({
+        classNames: [normalize(node.value)],
+        end: node.sourceIndex + node.toString().length,
+        replacement: () => null,
+        start: node.sourceIndex,
+      });
+      return;
+    }
+
+    if (node.operator !== "=" && node.operator !== "~=") {
+      return;
+    }
+
     const classNamePattern = /[^\t\n\f\r ]+/g;
     const classNames = [...node.value.matchAll(classNamePattern)].map((match) =>
       normalize(match[0]),

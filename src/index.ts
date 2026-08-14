@@ -307,8 +307,7 @@ function javascriptStringToken(source: string, value: unknown): TextToken | null
   const node = astNode(value);
 
   if (
-    node?.type !== "Literal" ||
-    typeof node.value !== "string" ||
+    node === null ||
     typeof node.start !== "number" ||
     typeof node.end !== "number"
   ) {
@@ -316,8 +315,17 @@ function javascriptStringToken(source: string, value: unknown): TextToken | null
   }
 
   const quote = source.charAt(node.start);
+  const isStringLiteral =
+    node.type === "Literal" &&
+    typeof node.value === "string" &&
+    (quote === '"' || quote === "'");
+  const isStaticTemplate =
+    node.type === "TemplateLiteral" &&
+    Array.isArray(node.expressions) &&
+    node.expressions.length === 0 &&
+    quote === "`";
 
-  if ((quote !== '"' && quote !== "'") || source.charAt(node.end - 1) !== quote) {
+  if ((!isStringLiteral && !isStaticTemplate) || source.charAt(node.end - 1) !== quote) {
     return null;
   }
 
@@ -436,23 +444,33 @@ function cssValueUrlTokens(value: string, offset = 0): TextToken[] {
   const parsed = valueParser(value);
 
   parsed.walk((node) => {
-    if (node.type !== "function" || node.value.toLowerCase() !== "url") {
+    if (node.type !== "function") {
       return;
     }
 
-    const token = node.nodes.find(
-      (candidate) => candidate.type !== "space" && candidate.type !== "comment",
-    );
+    const functionName = node.value.toLowerCase();
+    const candidates =
+      functionName === "url"
+        ? [
+            node.nodes.find(
+              (candidate) =>
+                candidate.type !== "space" && candidate.type !== "comment",
+            ),
+          ]
+        : functionName === "image-set" || functionName === "-webkit-image-set"
+          ? node.nodes.filter((candidate) => candidate.type === "string")
+          : [];
 
-    if (token?.type !== "string" && token?.type !== "word") {
-      return false;
+    for (const token of candidates) {
+      if (token?.type !== "string" && token?.type !== "word") {
+        continue;
+      }
+
+      const quoted = token.type === "string";
+      const start = offset + token.sourceIndex + (quoted ? 1 : 0);
+      const end = offset + token.sourceEndIndex - (quoted ? 1 : 0);
+      tokens.push({ end, start, value: value.slice(start - offset, end - offset) });
     }
-
-    const quoted = token.type === "string";
-    const start = offset + token.sourceIndex + (quoted ? 1 : 0);
-    const end = offset + token.sourceEndIndex - (quoted ? 1 : 0);
-    tokens.push({ end, start, value: value.slice(start - offset, end - offset) });
-    return false;
   });
 
   return tokens;
@@ -750,12 +768,15 @@ function replaceStructuredFileNameReferences(
         }
 
         if (updatedValue !== decodedValue) {
+          const replacement =
+            attribute.quote === undefined && decodedValue !== attribute.value
+              ? `"${escapeAttribute(updatedValue)}"`
+              : decodedValue === attribute.value
+                ? updatedValue
+                : escapeAttribute(updatedValue);
           edits.push({
             end: tag.start + attribute.valueEnd,
-            replacement:
-              decodedValue === attribute.value
-                ? updatedValue
-                : escapeAttribute(updatedValue),
+            replacement,
             start: tag.start + attribute.valueStart,
           });
         }
@@ -831,6 +852,7 @@ function replaceSourceMapFileNameReferences(
   try {
     const sourceMap = JSON.parse(value) as {
       file?: unknown;
+      sections?: unknown;
       sources?: unknown;
     };
     let changed = false;
@@ -854,6 +876,23 @@ function replaceSourceMapFileNameReferences(
         changed ||= replacement !== source;
         return replacement;
       });
+    }
+
+    if (Array.isArray(sourceMap.sections)) {
+      for (const sectionValue of sourceMap.sections) {
+        const section = astNode(sectionValue);
+
+        if (typeof section?.url !== "string") {
+          continue;
+        }
+
+        const replacement = replaceFileNameReference(section.url, replacements);
+
+        if (replacement !== section.url) {
+          section.url = replacement;
+          changed = true;
+        }
+      }
     }
 
     return changed ? JSON.stringify(sourceMap) : value;

@@ -859,6 +859,8 @@ describe("stylexMangleClassNames", () => {
         `import /* generated asset */ "${relativeFileName}";`,
         `import(/* generated asset */ "${relativeFileName}");`,
         `new URL(/* generated asset */ "${relativeFileName}", import.meta.url);`,
+        `import(\`${relativeFileName}\`);`,
+        `new URL(\`${relativeFileName}\`, import.meta.url);`,
       ].join("\n"),
     );
 
@@ -868,7 +870,56 @@ describe("stylexMangleClassNames", () => {
     });
 
     expect(javascript.code).not.toContain(preliminaryCssFileName);
-    expect(javascript.code.match(new RegExp(target.fileName, "g"))).toHaveLength(3);
+    expect(javascript.code.match(new RegExp(target.fileName, "g"))).toHaveLength(5);
+  });
+
+  test.each(["image-set", "-webkit-image-set"])(
+    "updates string URLs in %s()",
+    (functionName) => {
+      const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+      const preliminaryImageFileName = preliminaryAssetFileName(
+        plugin,
+        "image.png",
+        "image",
+        "image000",
+      );
+      const image = outputAsset(preliminaryImageFileName, "image");
+      const css = outputAsset(
+        "styles.css",
+        `.hero{background-image:${functionName}("${preliminaryImageFileName}" 1x)}`,
+      );
+
+      runGenerateBundle(plugin, {
+        [css.fileName]: css,
+        [image.fileName]: image,
+      });
+
+      expect(css.source).toBe(
+        `.hero{background-image:${functionName}("${image.fileName}" 1x)}`,
+      );
+    },
+  );
+
+  test("quotes decoded unquoted HTML URLs that contain whitespace", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const preliminaryCssFileName = preliminaryAssetFileName(
+      plugin,
+      "theme map.css",
+      ".theme{color:red}",
+      "theme000",
+    );
+    const css = outputAsset(preliminaryCssFileName, ".theme{color:red}");
+    const html = outputAsset(
+      "index.html",
+      `<link href=${preliminaryCssFileName.replace(" ", "&#32;")}>`,
+    );
+
+    runGenerateBundle(plugin, {
+      [css.fileName]: css,
+      [html.fileName]: html,
+    });
+
+    expect(html.source).toBe(`<link href="${css.fileName}">`);
   });
 
   test("updates double-quoted references to filenames containing apostrophes", () => {
@@ -1343,6 +1394,36 @@ describe("stylexMangleClassNames", () => {
 
     expect(chunk.fileName).not.toBe(preliminaryFileName);
     expect(finalizedMap.file).toBe(chunk.fileName);
+  });
+
+  test("updates finalized filenames in indexed source-map section URLs", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const sectionMapFileName = preliminaryAssetFileName(
+      plugin,
+      "section.map",
+      '{"mappings":"","names":[],"sources":[],"version":3}',
+      "section0",
+    );
+    const sectionMap = outputAsset(
+      sectionMapFileName,
+      '{"mappings":"","names":[],"sources":[],"version":3}',
+    );
+    const indexedMap = outputAsset(
+      "entry.js.map",
+      JSON.stringify({
+        sections: [{ offset: { column: 0, line: 0 }, url: sectionMapFileName }],
+        version: 3,
+      }),
+    );
+
+    runGenerateBundle(plugin, {
+      [indexedMap.fileName]: indexedMap,
+      [sectionMap.fileName]: sectionMap,
+    });
+
+    expect(JSON.parse(String(indexedMap.source))).toMatchObject({
+      sections: [{ url: sectionMap.fileName }],
+    });
   });
 
   test("finalizes a chunk and its default source map with their shared hash", () => {
@@ -2034,6 +2115,26 @@ describe("stylexMangleClassNames", () => {
     expect(css.source).toBe(`.a{color:red}[class^="${PREFIX}1"]{color:blue}`);
   });
 
+  test.each(["^=", "$=", "*=", "|="])(
+    "detects generated-name collisions in class %s selectors",
+    (operator) => {
+      const javascript = outputChunk(
+        `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+      );
+      const css = outputAsset(
+        "styles.css",
+        `.${PREFIX}1{color:red}[class${operator}"a"]{color:blue}`,
+      );
+
+      expect(() =>
+        runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+          [css.fileName]: css,
+          [javascript.fileName]: javascript,
+        }),
+      ).toThrow(/would collide with authored CSS/);
+    },
+  );
+
   test("splits CSS class values only on CSS whitespace", () => {
     const javascript = outputChunk(
       `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
@@ -2148,6 +2249,41 @@ describe("stylexMangleClassNames", () => {
 
     expect(css.source).toBe(`.a{color:red}.é${PREFIX}1{color:blue}`);
     expect(html.source).toBe(`<div class="é${PREFIX}1 a"></div>`);
+  });
+
+  test("does not rewrite generated-name substrings after non-ASCII symbols", () => {
+    const source = [
+      `inject({ ltr: ".${PREFIX}1{color:red}" });`,
+      `globalThis.generated = "${PREFIX}1";`,
+      `globalThis.authored = "💥${PREFIX}1";`,
+    ].join("\n");
+
+    expect(rewriteBundle(source)).toBe(
+      [
+        'inject({ ltr: ".a{color:red}" });',
+        'globalThis.generated = "a";',
+        `globalThis.authored = "💥${PREFIX}1";`,
+      ].join("\n"),
+    );
+  });
+
+  test("rewrites classes in noscript fallback markup", () => {
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    );
+    const css = outputAsset("styles.css", `.${PREFIX}1{color:red}`);
+    const html = outputAsset(
+      "index.html",
+      `<noscript><div class="${PREFIX}1"></div></noscript>`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [css.fileName]: css,
+      [html.fileName]: html,
+      [javascript.fileName]: javascript,
+    });
+
+    expect(html.source).toBe('<noscript><div class="a"></div></noscript>');
   });
 
   test("splits HTML class values only on ASCII whitespace", () => {

@@ -19,6 +19,7 @@ export type HtmlStartTag = {
 export type HtmlAttribute = {
   decodedValue?: string;
   name: string;
+  quote?: '"' | "'";
   value?: string;
   valueEnd?: number;
   valueStart?: number;
@@ -59,16 +60,19 @@ function htmlAttribute(
     valueStart += 1;
   }
 
-  const quote = attributeSource.charAt(valueStart);
-  const quoted = quote === "\"" || quote === "'";
-  valueStart += quoted ? 1 : 0;
-  const valueEnd = quoted ? attributeSource.lastIndexOf(quote) : attributeSource.length;
+  const candidateQuote = attributeSource.charAt(valueStart);
+  const quote =
+    candidateQuote === "\"" || candidateQuote === "'" ? candidateQuote : undefined;
+  valueStart += quote === undefined ? 0 : 1;
+  const valueEnd =
+    quote === undefined ? attributeSource.length : attributeSource.lastIndexOf(quote);
   const absoluteValueStart = location.startOffset + valueStart;
   const absoluteValueEnd = location.startOffset + Math.max(valueStart, valueEnd);
 
   return {
     decodedValue,
     name,
+    quote,
     value: source.slice(absoluteValueStart, absoluteValueEnd),
     valueEnd: absoluteValueEnd - tagStart,
     valueStart: absoluteValueStart - tagStart,
@@ -76,7 +80,10 @@ function htmlAttribute(
 }
 
 export function findHtmlStartTags(source: string): HtmlStartTag[] {
-  const document = parse(source, { sourceCodeLocationInfo: true });
+  const document = parse(source, {
+    scriptingEnabled: false,
+    sourceCodeLocationInfo: true,
+  });
   const tags: HtmlStartTag[] = [];
 
   function visit(node: HtmlNode): void {
