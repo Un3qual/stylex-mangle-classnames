@@ -4,8 +4,10 @@ import {
   fromCodePoint,
   htmlDecodeTree,
 } from "entities/decode";
+import { parse, type DefaultTreeAdapterTypes } from "parse5";
 
 export type HtmlStartTag = {
+  attributes: HtmlAttribute[];
   contentEnd?: number;
   contentStart?: number;
   end: number;
@@ -28,198 +30,109 @@ export type HtmlAttributeValueToken = {
 };
 
 const htmlSpacePattern = /[\t\n\f\r ]/;
-const rawTextTagNames = new Set([
-  "iframe",
-  "noembed",
-  "noframes",
-  "script",
-  "style",
-  "textarea",
-  "title",
-  "xmp",
-]);
+type HtmlNode = DefaultTreeAdapterTypes.Node;
 
-function findStartTagEnd(source: string, start: number): number | null {
-  let quote: "\"" | "'" | null = null;
+function isHtmlElement(
+  node: HtmlNode,
+): node is DefaultTreeAdapterTypes.Element {
+  return "tagName" in node;
+}
 
-  for (let index = start + 1; index < source.length; index += 1) {
-    const character = source.charAt(index);
+function htmlAttribute(
+  source: string,
+  tagStart: number,
+  name: string,
+  location: { endOffset: number; startOffset: number },
+): HtmlAttribute {
+  const attributeSource = source.slice(location.startOffset, location.endOffset);
+  const equals = attributeSource.indexOf("=");
 
-    if (quote !== null) {
-      if (character === quote) {
-        quote = null;
-      }
-
-      continue;
-    }
-
-    if (character === "\"" || character === "'") {
-      quote = character;
-    } else if (character === ">") {
-      return index + 1;
-    }
+  if (equals < 0) {
+    return { name };
   }
 
-  return null;
+  let valueStart = equals + 1;
+
+  while (htmlSpacePattern.test(attributeSource.charAt(valueStart))) {
+    valueStart += 1;
+  }
+
+  const quote = attributeSource.charAt(valueStart);
+  const quoted = quote === "\"" || quote === "'";
+  valueStart += quoted ? 1 : 0;
+  const valueEnd = quoted ? attributeSource.lastIndexOf(quote) : attributeSource.length;
+  const absoluteValueStart = location.startOffset + valueStart;
+  const absoluteValueEnd = location.startOffset + Math.max(valueStart, valueEnd);
+
+  return {
+    name,
+    value: source.slice(absoluteValueStart, absoluteValueEnd),
+    valueEnd: absoluteValueEnd - tagStart,
+    valueStart: absoluteValueStart - tagStart,
+  };
 }
 
 export function findHtmlStartTags(source: string): HtmlStartTag[] {
+  const document = parse(source, { sourceCodeLocationInfo: true });
   const tags: HtmlStartTag[] = [];
-  let index = 0;
 
-  while (index < source.length) {
-    const start = source.indexOf("<", index);
+  function visit(node: HtmlNode): void {
+    if (isHtmlElement(node)) {
+      const location = node.sourceCodeLocation;
+      const startTag = location?.startTag;
 
-    if (start < 0) {
-      break;
+      if (location !== null && location !== undefined && startTag !== undefined) {
+        const attributes = node.attrs.flatMap((attribute) => {
+          const attributeLocation = location.attrs?.[attribute.name];
+
+          return attributeLocation === undefined
+            ? []
+            : [
+                htmlAttribute(
+                  source,
+                  startTag.startOffset,
+                  attribute.name,
+                  attributeLocation,
+                ),
+              ];
+        });
+        const tag: HtmlStartTag = {
+          attributes,
+          end: startTag.endOffset,
+          source: source.slice(startTag.startOffset, startTag.endOffset),
+          start: startTag.startOffset,
+          tagName: node.tagName,
+        };
+
+        if (location.endTag !== undefined) {
+          tag.contentStart = startTag.endOffset;
+          tag.contentEnd = location.endTag.startOffset;
+        } else if (node.tagName === "plaintext") {
+          tag.contentStart = startTag.endOffset;
+          tag.contentEnd = location.endOffset;
+        }
+
+        tags.push(tag);
+      }
+
+      if (node.nodeName === "template") {
+        visit((node as DefaultTreeAdapterTypes.Template).content);
+      }
     }
 
-    if (source.startsWith("<!--", start)) {
-      const commentEnd = source.indexOf("-->", start + 4);
-      index = commentEnd < 0 ? source.length : commentEnd + 3;
-      continue;
+    if ("childNodes" in node) {
+      for (const child of node.childNodes) {
+        visit(child);
+      }
     }
-
-    const tagNameMatch = /^<([A-Za-z][A-Za-z\d:-]*)(?=[\t\n\f\r />])/.exec(
-      source.slice(start),
-    );
-
-    if (tagNameMatch === null) {
-      index = start + 1;
-      continue;
-    }
-
-    const end = findStartTagEnd(source, start);
-
-    if (end === null) {
-      break;
-    }
-
-    const tagName = (tagNameMatch[1] ?? "").toLowerCase();
-    const tag: HtmlStartTag = {
-      end,
-      source: source.slice(start, end),
-      start,
-      tagName,
-    };
-
-    if (tagName === "plaintext") {
-      tag.contentStart = end;
-      tag.contentEnd = source.length;
-      tags.push(tag);
-      break;
-    }
-
-    if (!rawTextTagNames.has(tagName)) {
-      tags.push(tag);
-      index = end;
-      continue;
-    }
-
-    const closingTagPattern = new RegExp(`</${tagName}\\s*>`, "gi");
-    closingTagPattern.lastIndex = end;
-    const closingTag = closingTagPattern.exec(source);
-
-    if (closingTag === null) {
-      tags.push(tag);
-      index = end;
-      continue;
-    }
-
-    tag.contentStart = end;
-    tag.contentEnd = closingTag.index;
-    tags.push(tag);
-    index = closingTag.index + closingTag[0].length;
   }
 
-  return tags;
+  visit(document);
+  return tags.sort((left, right) => left.start - right.start);
 }
 
 export function findHtmlAttributes(tag: HtmlStartTag): HtmlAttribute[] {
-  const attributes: HtmlAttribute[] = [];
-  const tagName = /^<[A-Za-z][A-Za-z\d:-]*(?=[\t\n\f\r />])/.exec(
-    tag.source,
-  )?.[0];
-
-  if (tagName === undefined) {
-    return attributes;
-  }
-
-  let index = tagName.length;
-
-  while (index < tag.source.length) {
-    while (htmlSpacePattern.test(tag.source.charAt(index))) {
-      index += 1;
-    }
-
-    if (index >= tag.source.length || /[/>]/.test(tag.source.charAt(index))) {
-      break;
-    }
-
-    const nameStart = index;
-
-    while (
-      index < tag.source.length &&
-      !/[\t\n\f\r =/>]/.test(tag.source.charAt(index))
-    ) {
-      index += 1;
-    }
-
-    const name = tag.source.slice(nameStart, index).toLowerCase();
-
-    while (htmlSpacePattern.test(tag.source.charAt(index))) {
-      index += 1;
-    }
-
-    if (tag.source.charAt(index) !== "=") {
-      attributes.push({ name });
-      continue;
-    }
-
-    index += 1;
-
-    while (htmlSpacePattern.test(tag.source.charAt(index))) {
-      index += 1;
-    }
-
-    const quote = tag.source.charAt(index);
-
-    if (quote === "\"" || quote === "'") {
-      const valueStart = index + 1;
-      const valueEnd = tag.source.indexOf(quote, valueStart);
-
-      if (valueEnd < 0) {
-        break;
-      }
-
-      attributes.push({
-        name,
-        value: tag.source.slice(valueStart, valueEnd),
-        valueEnd,
-        valueStart,
-      });
-      index = valueEnd + 1;
-      continue;
-    }
-
-    const valueStart = index;
-
-    while (
-      index < tag.source.length &&
-      !/[\t\n\f\r >]/.test(tag.source.charAt(index))
-    ) {
-      index += 1;
-    }
-
-    attributes.push({
-      name,
-      value: tag.source.slice(valueStart, index),
-      valueEnd: index,
-      valueStart,
-    });
-  }
-
-  return attributes;
+  return tag.attributes;
 }
 
 export function htmlAttributeValueTokens(

@@ -53,7 +53,6 @@ const sourceMapDirectivePattern =
 const javascriptSourceMapDirectivePattern =
   /\/\/[#@]\s*sourceMappingURL=([^\s]+)\s*$/;
 const hashMarkerSentinelPattern = /__STYLEX_HASH_[0-9a-z]+_[0-9a-z]+__/g;
-const hashMarkerSentinelTestPattern = /__STYLEX_HASH_[0-9a-z]+_[0-9a-z]+__/;
 const htmlUrlAttributeNames = new Set([
   "action",
   "background",
@@ -74,7 +73,7 @@ function assetSourceToString(source: string | Uint8Array): string {
 }
 
 function isTextAsset(fileName: string): boolean {
-  return /\.(?:cjs|css|html|js|mjs)$/.test(fileName);
+  return /\.(?:cjs|css|html|js|mjs)$/i.test(fileName);
 }
 
 function textAssets(bundle: Rollup.OutputBundle): TextAsset[] {
@@ -87,15 +86,15 @@ function textAssets(bundle: Rollup.OutputBundle): TextAsset[] {
 }
 
 function isCssAsset({ output }: TextAsset): boolean {
-  return output.fileName.endsWith(".css");
+  return output.fileName.toLowerCase().endsWith(".css");
 }
 
 function isJavaScriptAsset({ output }: TextAsset): boolean {
-  return /\.(?:cjs|js|mjs)$/.test(output.fileName);
+  return /\.(?:cjs|js|mjs)$/i.test(output.fileName);
 }
 
 function isHtmlAsset({ output }: TextAsset): boolean {
-  return output.fileName.endsWith(".html");
+  return output.fileName.toLowerCase().endsWith(".html");
 }
 
 function contentHash(source: string, hashCharacters: HashCharacters): string {
@@ -296,7 +295,6 @@ function javascriptFileNameReferenceTokens(value: string): TextToken[] {
     const after = value.slice(token.end + 1, token.end + 100);
 
     return (
-      hashMarkerSentinelTestPattern.test(token.value) ||
       (/\bnew\s+URL\s*\(\s*$/.test(before) &&
         /^\s*,\s*import\.meta\.url\s*\)/.test(after)) ||
       (/\bimport\s*\(\s*$/.test(before) && /^\s*\)/.test(after)) ||
@@ -459,13 +457,18 @@ function fileNameReferenceTokens(
 ): string[] {
   const tokens: string[] = [];
 
-  for (const token of kind === "javascript"
-    ? javascriptFileNameReferenceTokens(value)
-    : quotedTokens(value)) {
+  const structuredTokens =
+    kind === "javascript"
+      ? javascriptFileNameReferenceTokens(value)
+      : kind === "generic"
+        ? quotedTokens(value)
+        : [];
+
+  for (const token of structuredTokens) {
     tokens.push(token.value);
   }
 
-  if (kind !== "javascript") {
+  if (kind === "generic") {
     for (const match of value.matchAll(/\burl\(\s*([^"')\s][^)]*?)\s*\)/gi)) {
       const token = match[1];
 
@@ -475,11 +478,13 @@ function fileNameReferenceTokens(
     }
   }
 
-  for (const match of value.matchAll(/(?:sourceMappingURL|sourceURL)=([^\s*]+)/g)) {
-    const token = match[1];
+  if (kind !== "html") {
+    for (const match of value.matchAll(/(?:sourceMappingURL|sourceURL)=([^\s*]+)/g)) {
+      const token = match[1];
 
-    if (token !== undefined) {
-      tokens.push(token);
+      if (token !== undefined) {
+        tokens.push(token);
+      }
     }
   }
 
@@ -516,6 +521,49 @@ function replaceStructuredFileNameReferences(
     );
   }
 
+  if (kind === "html") {
+    let updatedHtml = value;
+
+    for (const tag of findHtmlStartTags(value).reverse()) {
+      let updatedTag = tag.source;
+
+      for (const attribute of findHtmlAttributes(tag).reverse()) {
+        if (
+          attribute.value === undefined ||
+          attribute.valueStart === undefined ||
+          attribute.valueEnd === undefined
+        ) {
+          continue;
+        }
+
+        let updatedValue = attribute.value;
+
+        if (htmlUrlAttributeNames.has(attribute.name)) {
+          updatedValue = replaceFileNameReference(attribute.value, replacements);
+        } else if (htmlSrcsetAttributeNames.has(attribute.name)) {
+          for (const token of srcsetUrlTokens(attribute.value).reverse()) {
+            const replacement = replaceFileNameReference(
+              token.value,
+              replacements,
+            );
+
+            if (replacement !== token.value) {
+              updatedValue = `${updatedValue.slice(0, token.start)}${replacement}${updatedValue.slice(token.end)}`;
+            }
+          }
+        }
+
+        if (updatedValue !== attribute.value) {
+          updatedTag = `${updatedTag.slice(0, attribute.valueStart)}${updatedValue}${updatedTag.slice(attribute.valueEnd)}`;
+        }
+      }
+
+      updatedHtml = `${updatedHtml.slice(0, tag.start)}${updatedTag}${updatedHtml.slice(tag.end)}`;
+    }
+
+    return updatedHtml;
+  }
+
   let replaceQuoted = value;
 
   const quotedReferences = quotedTokens(value);
@@ -544,50 +592,7 @@ function replaceStructuredFileNameReferences(
     },
   );
 
-  if (kind !== "html") {
-    return replaceDirectives;
-  }
-
-  let updatedHtml = replaceDirectives;
-
-  for (const tag of findHtmlStartTags(replaceDirectives).reverse()) {
-    let updatedTag = tag.source;
-
-    for (const attribute of findHtmlAttributes(tag).reverse()) {
-      if (
-        attribute.value === undefined ||
-        attribute.valueStart === undefined ||
-        attribute.valueEnd === undefined
-      ) {
-        continue;
-      }
-
-      let updatedValue = attribute.value;
-
-      if (htmlUrlAttributeNames.has(attribute.name)) {
-        updatedValue = replaceFileNameReference(attribute.value, replacements);
-      } else if (htmlSrcsetAttributeNames.has(attribute.name)) {
-        for (const token of srcsetUrlTokens(attribute.value).reverse()) {
-          const replacement = replaceFileNameReference(
-            token.value,
-            replacements,
-          );
-
-          if (replacement !== token.value) {
-            updatedValue = `${updatedValue.slice(0, token.start)}${replacement}${updatedValue.slice(token.end)}`;
-          }
-        }
-      }
-
-      if (updatedValue !== attribute.value) {
-        updatedTag = `${updatedTag.slice(0, attribute.valueStart)}${updatedValue}${updatedTag.slice(attribute.valueEnd)}`;
-      }
-    }
-
-    updatedHtml = `${updatedHtml.slice(0, tag.start)}${updatedTag}${updatedHtml.slice(tag.end)}`;
-  }
-
-  return updatedHtml;
+  return replaceDirectives;
 }
 
 function replaceLastOccurrence(
@@ -859,12 +864,12 @@ function textValue(output: OutputFile): string | null {
 function structuredReferenceKind(output: OutputFile): StructuredReferenceKind {
   if (
     output.type === "chunk" ||
-    (output.type === "asset" && /\.(?:cjs|js|mjs)$/.test(output.fileName))
+    (output.type === "asset" && /\.(?:cjs|js|mjs)$/i.test(output.fileName))
   ) {
     return "javascript";
   }
 
-  return output.type === "asset" && output.fileName.endsWith(".html")
+  return output.type === "asset" && output.fileName.toLowerCase().endsWith(".html")
     ? "html"
     : "generic";
 }
@@ -964,7 +969,7 @@ function normalizeFileNameReferences(
     ...internalReplacements,
   ]);
   const updatedValue =
-    output.type === "asset" && output.fileName.endsWith(".map")
+    output.type === "asset" && output.fileName.toLowerCase().endsWith(".map")
       ? replaceSourceMapFileNameReferences(value, replacements)
       : replaceStructuredFileNameReferences(
           value,
@@ -1395,12 +1400,12 @@ function updateOutputFileNameReferences(
 
       let updatedSource: string;
 
-      if (output.fileName.endsWith(".map")) {
+      if (output.fileName.toLowerCase().endsWith(".map")) {
         updatedSource = replaceSourceMapFileNameReferences(
           source,
           replacements,
         );
-      } else if (output.fileName.endsWith(".css")) {
+      } else if (output.fileName.toLowerCase().endsWith(".css")) {
         const edits = cssFileNameReferenceEdits(
           source,
           replacements,
@@ -1414,7 +1419,7 @@ function updateOutputFileNameReferences(
                 source,
                 edits,
               );
-      } else if (/\.(?:cjs|js|mjs)$/.test(output.fileName)) {
+      } else if (/\.(?:cjs|js|mjs)$/i.test(output.fileName)) {
         const edits = javascriptFileNameReferenceEdits(
           source,
           replacements,

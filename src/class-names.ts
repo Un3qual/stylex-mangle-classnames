@@ -49,6 +49,28 @@ type SelectorClassReference = {
   start: number;
 };
 
+function classNameReplacement(
+  replacements: ReadonlyMap<string, string>,
+  className: string,
+  insensitive: boolean,
+): string | undefined {
+  const exact = replacements.get(className);
+
+  if (exact !== undefined || !insensitive) {
+    return exact;
+  }
+
+  const normalized = className.toLowerCase();
+
+  for (const [candidate, replacement] of replacements) {
+    if (candidate.toLowerCase() === normalized) {
+      return replacement;
+    }
+  }
+
+  return undefined;
+}
+
 function selectorClassReferences(selector: string): SelectorClassReference[] {
   const references: SelectorClassReference[] = [];
   const ast = selectorParser().astSync(selector);
@@ -72,7 +94,8 @@ function selectorClassReferences(selector: string): SelectorClassReference[] {
       return;
     }
 
-    const normalize = node.insensitive
+    const insensitive = node.insensitive === true;
+    const normalize = insensitive
       ? (className: string) => className.toLowerCase()
       : (className: string) => className;
     const classNames = [...node.value.matchAll(/\S+/g)].map((match) =>
@@ -83,8 +106,11 @@ function selectorClassReferences(selector: string): SelectorClassReference[] {
       classNames,
       end: node.sourceIndex + node.toString().length,
       replacement: (replacements) => {
-        const value = node.value?.replace(/\S+/g, (className) =>
-          replacements.get(normalize(className)) ?? className,
+        const value = node.value?.replace(
+          /\S+/g,
+          (className) =>
+            classNameReplacement(replacements, className, insensitive) ??
+            className,
         );
 
         if (value === undefined || value === node.value) {
