@@ -7,7 +7,7 @@ All notable changes to this project are documented in this file. The format foll
 ### Added
 
 - Accurate production JavaScript source maps for Vite's external, hidden, and inline modes.
-- Selector-aware authored CSS collision detection.
+- Class-selector collision detection for Rollup-emitted CSS rules.
 
 ### Changed
 

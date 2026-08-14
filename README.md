@@ -66,9 +66,11 @@ stylexMangleClassNames({ classNamePrefix: string }): Plugin
 - JavaScript is rewritten before Vite calculates chunk hashes.
 - External, hidden, and inline production source maps retain their original positions.
 - Runtime `constKey` registrations, CSS custom properties, keyframe suffixes, unrelated classes, and prefix-shaped application data remain unchanged.
-- The build fails if a generated short name collides with an authored selector in an emitted CSS asset.
+- The build fails if a generated short name collides with an authored class selector in a Rollup-emitted CSS rule.
 
 Short names are build artifacts. Their assignments may change when the generated class set changes.
+
+Collision checks do not scan files copied from Vite's `publicDir` or selector-like syntax in at-rule preludes such as `@scope`.
 
 ## Compatibility
 

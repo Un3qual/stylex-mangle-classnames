@@ -126,9 +126,10 @@ describe("production output", () => {
       const position = consumer.originalPositionFor(
         generatedPosition(javascript ?? "", "globalThis.marker"),
       );
+      const markerLine = original.split("\n").at(1) ?? "";
 
       expect(position).toMatchObject({
-        column: original.split("\n")[1]!.indexOf("globalThis.marker"),
+        column: markerLine.indexOf("globalThis.marker"),
         line: 2,
       });
       expect(position.source).toContain("virtual-entry.js");

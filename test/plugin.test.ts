@@ -31,7 +31,11 @@ function pluginContext(): Rollup.PluginContext {
   } as Rollup.PluginContext;
 }
 
-function runProductionBundle(plugin: Plugin, bundle: Rollup.OutputBundle): void {
+function runProductionBundle(
+  plugin: Plugin,
+  bundle: Rollup.OutputBundle,
+  moduleSources?: readonly string[],
+): void {
   const context = pluginContext();
 
   if (plugin.buildStart) {
@@ -51,13 +55,17 @@ function runProductionBundle(plugin: Plugin, bundle: Rollup.OutputBundle): void 
       ? plugin.moduleParsed
       : plugin.moduleParsed.handler;
 
-  for (const output of Object.values(bundle)) {
-    if (output.type === "chunk") {
-      moduleParsed.call(context, {
-        code: output.code,
-        id: output.fileName,
-      } as Rollup.ModuleInfo);
-    }
+  const sources =
+    moduleSources ??
+    Object.values(bundle)
+      .filter((output) => output.type === "chunk")
+      .map((output) => output.code);
+
+  for (const [index, code] of sources.entries()) {
+    moduleParsed.call(context, {
+      code,
+      id: `module-${index}.js`,
+    } as Rollup.ModuleInfo);
   }
 
   if (plugin.renderStart) {
@@ -151,7 +159,11 @@ async function runConfigResolved(
   } as ResolvedConfig);
 }
 
-async function runTransform(plugin: Plugin, code: string) {
+async function runTransform(
+  plugin: Plugin,
+  code: string,
+  id = "/virtual-entry.js",
+) {
   const hook = plugin.transform;
 
   if (!hook) {
@@ -159,7 +171,7 @@ async function runTransform(plugin: Plugin, code: string) {
   }
 
   const handler = typeof hook === "function" ? hook : hook.handler;
-  return handler.call({} as never, code, "/virtual-entry.js", {
+  return handler.call({} as never, code, id, {
     moduleType: "js",
   });
 }
@@ -280,13 +292,29 @@ describe("stylexMangleClassNames", () => {
     ).toThrow('generated class ".a" would collide with authored CSS');
   });
 
+  test("ignores short names reserved only by tree-shaken modules", () => {
+    const javascript = outputChunk("globalThis.loaded = true;");
+    const css = outputAsset("styles.css", ".a{color:blue}");
+
+    expect(() =>
+      runProductionBundle(
+        stylexMangleClassNames({ classNamePrefix: PREFIX }),
+        {
+          [css.fileName]: css,
+          [javascript.fileName]: javascript,
+        },
+        [`inject({ ltr: ".${PREFIX}1{color:red}" });`],
+      ),
+    ).not.toThrow();
+  });
+
   test("ignores class-like text outside CSS selectors", () => {
     const javascript = outputChunk(
       `inject({ ltr: ".${PREFIX}1{color:red}" });`,
     );
     const css = outputAsset(
       "styles.css",
-      `.theme{content:".a";--example:.a}/* .a */`,
+      '.theme{content:".a";--example:.a}/* .a */',
     );
 
     expect(() =>
@@ -315,6 +343,25 @@ describe("stylexMangleClassNames", () => {
     ].join("\n");
 
     await expect(runTransform(plugin, source)).resolves.toEqual({
+      code: [
+        'inject({ ltr: ".a{color:red}" });',
+        'globalThis.className = "a";',
+      ].join("\n"),
+      map: null,
+    });
+  });
+
+  test("rewrites Vite JavaScript proxies for inline HTML modules", async () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    await runConfigResolved(plugin, "serve");
+    const source = [
+      `inject({ ltr: ".${PREFIX}1{color:red}" });`,
+      `globalThis.className = "${PREFIX}1";`,
+    ].join("\n");
+
+    await expect(
+      runTransform(plugin, source, "/index.html?html-proxy&index=0.js"),
+    ).resolves.toEqual({
       code: [
         'inject({ ltr: ".a{color:red}" });',
         'globalThis.className = "a";',

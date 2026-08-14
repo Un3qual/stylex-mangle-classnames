@@ -44,7 +44,7 @@ function assertValidPrefix(classNamePrefix: string): void {
 }
 
 function isJavaScriptModule(id: string): boolean {
-  return !/\.(?:css|html)(?:$|\?)/i.test(id);
+  return !/\.css(?:$|\?)/i.test(id) && !/\.html$/i.test(id);
 }
 
 /** Shortens runtime-injected StyleX atomic class names in Vite output. */
@@ -57,12 +57,14 @@ export default function stylexMangleClassNames(
   const classNames = new Map<string, string>();
   const generatedNames = new Map<string, string>();
   const pendingBuildClassNames = new Set<string>();
+  const renderedClassNames = new Set<string>();
   let command: ResolvedConfig["command"] = "build";
 
   function reset(): void {
     classNames.clear();
     generatedNames.clear();
     pendingBuildClassNames.clear();
+    renderedClassNames.clear();
   }
 
   function registerClassNames(originals: ReadonlySet<string>): void {
@@ -104,7 +106,7 @@ export default function stylexMangleClassNames(
 
         const original = generatedNames.get(className);
 
-        if (original !== undefined) {
+        if (original !== undefined && renderedClassNames.has(className)) {
           context.error(collisionMessage(className, original));
         }
       }
@@ -161,9 +163,15 @@ export default function stylexMangleClassNames(
         classNames,
       );
 
-      return result.changed
-        ? rewriteWithSourceMap(code, chunk.fileName, result.edits)
-        : null;
+      if (!result.changed) {
+        return null;
+      }
+
+      for (const edit of result.edits) {
+        renderedClassNames.add(edit.replacement);
+      }
+
+      return rewriteWithSourceMap(code, chunk.fileName, result.edits);
     },
     generateBundle: {
       order: "post",
