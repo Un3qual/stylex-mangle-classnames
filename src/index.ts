@@ -12,7 +12,7 @@ import {
   rewriteStylexClassNamesInHtml,
   type StylexClassNameEdit,
 } from "./class-names.js";
-import { findHtmlStartTags } from "./html.js";
+import { findHtmlAttributes, findHtmlStartTags } from "./html.js";
 import { composeWithSourceMap, rewriteWithSourceMap } from "./source-maps.js";
 
 export type StylexMangleClassNamesOptions = {
@@ -53,10 +53,21 @@ const sourceMapDirectivePattern =
 const javascriptSourceMapDirectivePattern =
   /\/\/[#@]\s*sourceMappingURL=([^\s]+)\s*$/;
 const hashMarkerSentinelPattern = /__STYLEX_HASH_[0-9a-z]+_[0-9a-z]+__/g;
-const htmlUnquotedUrlAttributePattern =
-  /(\s(?:action|background|cite|data|formaction|href|manifest|poster|src)\s*=\s*)([^\s"'`=<>]+)/gi;
-const htmlSrcsetAttributePattern =
-  /(\s(?:imagesrcset|srcset)\s*=\s*)(?:(["'])((?:(?!\2)[^\r\n])*)\2|([^\s"'`=<>]+))/gi;
+const hashMarkerSentinelTestPattern = /__STYLEX_HASH_[0-9a-z]+_[0-9a-z]+__/;
+const htmlUrlAttributeNames = new Set([
+  "action",
+  "background",
+  "cite",
+  "data",
+  "formaction",
+  "href",
+  "manifest",
+  "poster",
+  "src",
+]);
+const htmlSrcsetAttributeNames = new Set(["imagesrcset", "srcset"]);
+const inlineSourceMapUrlPattern =
+  /^data:application\/json(?:;charset=[^;,]+)?(?:;base64)?,/i;
 
 function assetSourceToString(source: string | Uint8Array): string {
   return typeof source === "string" ? source : new TextDecoder().decode(source);
@@ -285,6 +296,7 @@ function javascriptFileNameReferenceTokens(value: string): TextToken[] {
     const after = value.slice(token.end + 1, token.end + 100);
 
     return (
+      hashMarkerSentinelTestPattern.test(token.value) ||
       (/\bnew\s+URL\s*\(\s*$/.test(before) &&
         /^\s*,\s*import\.meta\.url\s*\)/.test(after)) ||
       (/\bimport\s*\(\s*$/.test(before) && /^\s*\)/.test(after)) ||
@@ -473,19 +485,17 @@ function fileNameReferenceTokens(
 
   if (kind === "html") {
     for (const tag of findHtmlStartTags(value)) {
-      for (const match of tag.source.matchAll(htmlUnquotedUrlAttributePattern)) {
-        const token = match[2];
-
-        if (token !== undefined) {
-          tokens.push(token);
+      for (const attribute of findHtmlAttributes(tag)) {
+        if (attribute.value === undefined) {
+          continue;
         }
-      }
 
-      for (const match of tag.source.matchAll(htmlSrcsetAttributePattern)) {
-        const srcset = match[3] ?? match[4];
-
-        if (srcset !== undefined) {
-          tokens.push(...srcsetUrlTokens(srcset).map((token) => token.value));
+        if (htmlUrlAttributeNames.has(attribute.name)) {
+          tokens.push(attribute.value);
+        } else if (htmlSrcsetAttributeNames.has(attribute.name)) {
+          tokens.push(
+            ...srcsetUrlTokens(attribute.value).map((token) => token.value),
+          );
         }
       }
     }
@@ -541,41 +551,38 @@ function replaceStructuredFileNameReferences(
   let updatedHtml = replaceDirectives;
 
   for (const tag of findHtmlStartTags(replaceDirectives).reverse()) {
-    const updatedUrlAttributes = tag.source.replace(
-      htmlUnquotedUrlAttributePattern,
-      (match, prefix: string, token: string) => {
-        const replacement = replaceFileNameReference(token, replacements);
-        return replacement === token ? match : `${prefix}${replacement}`;
-      },
-    );
-    const updatedTag = updatedUrlAttributes.replace(
-      htmlSrcsetAttributePattern,
-      (match, prefix: string, quote: string | undefined, quoted: string | undefined, unquoted: string | undefined) => {
-        const srcset = quoted ?? unquoted;
+    let updatedTag = tag.source;
 
-        if (srcset === undefined) {
-          return match;
-        }
+    for (const attribute of findHtmlAttributes(tag).reverse()) {
+      if (
+        attribute.value === undefined ||
+        attribute.valueStart === undefined ||
+        attribute.valueEnd === undefined
+      ) {
+        continue;
+      }
 
-        let updatedSrcset = srcset;
+      let updatedValue = attribute.value;
 
-        for (const token of srcsetUrlTokens(srcset).reverse()) {
-          const replacement = replaceFileNameReference(token.value, replacements);
+      if (htmlUrlAttributeNames.has(attribute.name)) {
+        updatedValue = replaceFileNameReference(attribute.value, replacements);
+      } else if (htmlSrcsetAttributeNames.has(attribute.name)) {
+        for (const token of srcsetUrlTokens(attribute.value).reverse()) {
+          const replacement = replaceFileNameReference(
+            token.value,
+            replacements,
+          );
 
           if (replacement !== token.value) {
-            updatedSrcset = `${updatedSrcset.slice(0, token.start)}${replacement}${updatedSrcset.slice(token.end)}`;
+            updatedValue = `${updatedValue.slice(0, token.start)}${replacement}${updatedValue.slice(token.end)}`;
           }
         }
+      }
 
-        if (updatedSrcset === srcset) {
-          return match;
-        }
-
-        return quote === undefined
-          ? `${prefix}${updatedSrcset}`
-          : `${prefix}${quote}${updatedSrcset}${quote}`;
-      },
-    );
+      if (updatedValue !== attribute.value) {
+        updatedTag = `${updatedTag.slice(0, attribute.valueStart)}${updatedValue}${updatedTag.slice(attribute.valueEnd)}`;
+      }
+    }
 
     updatedHtml = `${updatedHtml.slice(0, tag.start)}${updatedTag}${updatedHtml.slice(tag.end)}`;
   }
@@ -705,10 +712,14 @@ function rewriteJavaScriptWithSourceMap(
   const rewrite = rewriteWithSourceMap(source, outputFileName, edits);
   const sourceMapUrl = javascriptSourceMapUrl(source);
 
-  if (sourceMapUrl?.startsWith("data:application/json") === true) {
-    const inline = /^data:application\/json(?:;charset=[^;,]+)?(;base64)?,(.*)$/.exec(
-      sourceMapUrl,
-    );
+  if (
+    sourceMapUrl !== undefined &&
+    inlineSourceMapUrlPattern.test(sourceMapUrl)
+  ) {
+    const inline =
+      /^data:application\/json(?:;charset=[^;,]+)?(;base64)?,(.*)$/i.exec(
+        sourceMapUrl,
+      );
     const inlineData = inline?.[2];
 
     if (inline === null || inlineData === undefined) {
@@ -754,10 +765,14 @@ function rewriteCssWithSourceMap(
   const directive = source.match(sourceMapDirectivePattern);
   const sourceMapUrl = directive?.[1];
 
-  if (sourceMapUrl?.startsWith("data:application/json") === true) {
-    const inline = /^data:application\/json(?:;charset=[^;,]+)?(;base64)?,(.*)$/.exec(
-      sourceMapUrl,
-    );
+  if (
+    sourceMapUrl !== undefined &&
+    inlineSourceMapUrlPattern.test(sourceMapUrl)
+  ) {
+    const inline =
+      /^data:application\/json(?:;charset=[^;,]+)?(;base64)?,(.*)$/i.exec(
+        sourceMapUrl,
+      );
 
     if (inline === null) {
       return rewrite.code;
@@ -832,7 +847,13 @@ function textValue(output: OutputFile): string | null {
     return output.code;
   }
 
-  return typeof output.source === "string" ? output.source : null;
+  if (typeof output.source === "string") {
+    return output.source;
+  }
+
+  return isTextAsset(output.fileName)
+    ? assetSourceToString(output.source)
+    : null;
 }
 
 function structuredReferenceKind(output: OutputFile): StructuredReferenceKind {
@@ -891,7 +912,10 @@ function replaceInlineSourceMapFileNameReferences(
 ): string {
   const sourceMapUrl = javascriptSourceMapUrl(value);
 
-  if (sourceMapUrl?.startsWith("data:application/json") !== true) {
+  if (
+    sourceMapUrl === undefined ||
+    !inlineSourceMapUrlPattern.test(sourceMapUrl)
+  ) {
     return value;
   }
 
@@ -1205,7 +1229,9 @@ function computeFinalFileNames(
           (marker) => nativeHashForMarker(fileName, marker) ?? "",
         );
         const source =
-          output.type === "asset" && typeof output.source !== "string"
+          output.type === "asset" &&
+          typeof output.source !== "string" &&
+          !isTextAsset(output.fileName)
             ? `binary:${Buffer.from(output.source).toString("base64")}`
             : normalizeFileNameReferences(
                 output,
@@ -1239,13 +1265,15 @@ function computeFinalFileNames(
         "preliminary output filename",
       );
 
-      markersInFileName(fileName, markers).forEach((marker, markerIndex) => {
+      const digest = contentHash(
+        `${groupSeed}\0${memberIndex}`,
+        hashCharacters,
+      );
+
+      markersInFileName(fileName, markers).forEach((marker) => {
         hashes.set(
           marker.sentinel,
-          contentHash(
-            `${groupSeed}\0${memberIndex}\0${markerIndex}`,
-            hashCharacters,
-          ).slice(0, marker.length),
+          digest.slice(0, marker.length),
         );
       });
     });
@@ -1358,45 +1386,51 @@ function updateOutputFileNameReferences(
           replacements,
         );
       }
-    } else if (typeof output.source === "string") {
+    } else {
+      const source = textValue(output);
+
+      if (source === null) {
+        continue;
+      }
+
       let updatedSource: string;
 
       if (output.fileName.endsWith(".map")) {
         updatedSource = replaceSourceMapFileNameReferences(
-          output.source,
+          source,
           replacements,
         );
       } else if (output.fileName.endsWith(".css")) {
         const edits = cssFileNameReferenceEdits(
-          output.source,
+          source,
           replacements,
         );
         updatedSource =
           edits.length === 0
-            ? output.source
+            ? source
             : rewriteCssWithSourceMap(
                 bundle,
                 output,
-                output.source,
+                source,
                 edits,
               );
       } else if (/\.(?:cjs|js|mjs)$/.test(output.fileName)) {
         const edits = javascriptFileNameReferenceEdits(
-          output.source,
+          source,
           replacements,
         );
         updatedSource =
           edits.length === 0
-            ? output.source
+            ? source
             : rewriteJavaScriptWithSourceMap(
                 bundle,
                 output.fileName,
-                output.source,
+                source,
                 edits,
               );
       } else {
         updatedSource = replaceStructuredFileNameReferences(
-          output.source,
+          source,
           replacements,
           structuredReferenceKind(output),
         );

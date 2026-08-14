@@ -1,6 +1,11 @@
+import { decodeHTMLAttribute } from "entities/decode";
 import postcss from "postcss";
 import selectorParser from "postcss-selector-parser";
-import { findHtmlAttributes, findHtmlStartTags } from "./html.js";
+import {
+  findHtmlAttributes,
+  findHtmlStartTags,
+  htmlAttributeValueTokens,
+} from "./html.js";
 
 const SHORT_CLASS_NAME_ALPHABET = "abcdefghijklmnopqrstuvwxyz";
 const CSS_IDENTIFIER_CHARACTER = String.raw`\p{ID_Continue}-`;
@@ -492,8 +497,18 @@ function inlineCssFragmentsInHtml(source: string): SourceFragment[] {
   const fragments: SourceFragment[] = [];
 
   for (const tag of findHtmlStartTags(source)) {
+    if (tag.tagName !== "style") {
+      continue;
+    }
+
+    const type = findHtmlAttributes(tag).find(
+      (attribute) => attribute.name === "type",
+    )?.value;
+    const decodedType =
+      type === undefined ? "" : decodeHTMLAttribute(type).trim();
+
     if (
-      tag.tagName !== "style" ||
+      (decodedType !== "" && decodedType.toLowerCase() !== "text/css") ||
       tag.contentStart === undefined ||
       tag.contentEnd === undefined
     ) {
@@ -530,15 +545,19 @@ export function rewriteStylexClassNamesInHtml(
         continue;
       }
 
-      for (const token of attribute.value.matchAll(/\S+/g)) {
-        const replacement = classNames.get(token[0]);
+      for (const token of htmlAttributeValueTokens(attribute.value)) {
+        const replacement = classNames.get(token.value);
 
         if (replacement === undefined) {
           continue;
         }
 
-        const start = tag.start + attribute.valueStart + token.index;
-        edits.push({ end: start + token[0].length, replacement, start });
+        const start = tag.start + attribute.valueStart + token.start;
+        edits.push({
+          end: tag.start + attribute.valueStart + token.end,
+          replacement,
+          start,
+        });
       }
     }
   }

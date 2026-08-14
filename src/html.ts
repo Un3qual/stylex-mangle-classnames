@@ -1,3 +1,10 @@
+import {
+  DecodingMode,
+  EntityDecoder,
+  fromCodePoint,
+  htmlDecodeTree,
+} from "entities/decode";
+
 export type HtmlStartTag = {
   contentEnd?: number;
   contentStart?: number;
@@ -14,7 +21,23 @@ export type HtmlAttribute = {
   valueStart?: number;
 };
 
-const rawTextTagNames = new Set(["script", "style", "textarea", "title"]);
+export type HtmlAttributeValueToken = {
+  end: number;
+  start: number;
+  value: string;
+};
+
+const htmlSpacePattern = /[\t\n\f\r ]/;
+const rawTextTagNames = new Set([
+  "iframe",
+  "noembed",
+  "noframes",
+  "script",
+  "style",
+  "textarea",
+  "title",
+  "xmp",
+]);
 
 function findStartTagEnd(source: string, start: number): number | null {
   let quote: "\"" | "'" | null = null;
@@ -57,7 +80,9 @@ export function findHtmlStartTags(source: string): HtmlStartTag[] {
       continue;
     }
 
-    const tagNameMatch = /^<([A-Za-z][A-Za-z\d:-]*)\b/.exec(source.slice(start));
+    const tagNameMatch = /^<([A-Za-z][A-Za-z\d:-]*)(?=[\t\n\f\r />])/.exec(
+      source.slice(start),
+    );
 
     if (tagNameMatch === null) {
       index = start + 1;
@@ -78,7 +103,14 @@ export function findHtmlStartTags(source: string): HtmlStartTag[] {
       tagName,
     };
 
-    if (!rawTextTagNames.has(tagName) || /\/\s*>$/.test(tag.source)) {
+    if (tagName === "plaintext") {
+      tag.contentStart = end;
+      tag.contentEnd = source.length;
+      tags.push(tag);
+      break;
+    }
+
+    if (!rawTextTagNames.has(tagName)) {
       tags.push(tag);
       index = end;
       continue;
@@ -105,7 +137,9 @@ export function findHtmlStartTags(source: string): HtmlStartTag[] {
 
 export function findHtmlAttributes(tag: HtmlStartTag): HtmlAttribute[] {
   const attributes: HtmlAttribute[] = [];
-  const tagName = /^<[A-Za-z][A-Za-z\d:-]*/.exec(tag.source)?.[0];
+  const tagName = /^<[A-Za-z][A-Za-z\d:-]*(?=[\t\n\f\r />])/.exec(
+    tag.source,
+  )?.[0];
 
   if (tagName === undefined) {
     return attributes;
@@ -114,7 +148,7 @@ export function findHtmlAttributes(tag: HtmlStartTag): HtmlAttribute[] {
   let index = tagName.length;
 
   while (index < tag.source.length) {
-    while (/\s/.test(tag.source.charAt(index))) {
+    while (htmlSpacePattern.test(tag.source.charAt(index))) {
       index += 1;
     }
 
@@ -126,14 +160,14 @@ export function findHtmlAttributes(tag: HtmlStartTag): HtmlAttribute[] {
 
     while (
       index < tag.source.length &&
-      !/[\s=/>]/.test(tag.source.charAt(index))
+      !/[\t\n\f\r =/>]/.test(tag.source.charAt(index))
     ) {
       index += 1;
     }
 
     const name = tag.source.slice(nameStart, index).toLowerCase();
 
-    while (/\s/.test(tag.source.charAt(index))) {
+    while (htmlSpacePattern.test(tag.source.charAt(index))) {
       index += 1;
     }
 
@@ -144,7 +178,7 @@ export function findHtmlAttributes(tag: HtmlStartTag): HtmlAttribute[] {
 
     index += 1;
 
-    while (/\s/.test(tag.source.charAt(index))) {
+    while (htmlSpacePattern.test(tag.source.charAt(index))) {
       index += 1;
     }
 
@@ -172,7 +206,7 @@ export function findHtmlAttributes(tag: HtmlStartTag): HtmlAttribute[] {
 
     while (
       index < tag.source.length &&
-      !/[\s>]/.test(tag.source.charAt(index))
+      !/[\t\n\f\r >]/.test(tag.source.charAt(index))
     ) {
       index += 1;
     }
@@ -186,4 +220,61 @@ export function findHtmlAttributes(tag: HtmlStartTag): HtmlAttribute[] {
   }
 
   return attributes;
+}
+
+export function htmlAttributeValueTokens(
+  value: string,
+): HtmlAttributeValueToken[] {
+  const tokens: HtmlAttributeValueToken[] = [];
+  let current: HtmlAttributeValueToken | undefined;
+  let decodedEntity = "";
+  const decoder = new EntityDecoder(htmlDecodeTree, (codePoint) => {
+    decodedEntity += fromCodePoint(codePoint);
+  });
+
+  function append(decoded: string, start: number, end: number): void {
+    if ([...decoded].every((character) => htmlSpacePattern.test(character))) {
+      if (current !== undefined) {
+        tokens.push(current);
+        current = undefined;
+      }
+      return;
+    }
+
+    if (current === undefined) {
+      current = { end, start, value: decoded };
+    } else {
+      current.end = end;
+      current.value += decoded;
+    }
+  }
+
+  let index = 0;
+
+  while (index < value.length) {
+    if (value.charAt(index) === "&") {
+      decodedEntity = "";
+      decoder.startEntity(DecodingMode.Attribute);
+      let consumed = decoder.write(value, index + 1);
+
+      if (consumed < 0) {
+        consumed = decoder.end();
+      }
+
+      if (consumed > 0) {
+        append(decodedEntity, index, index + consumed);
+        index += consumed;
+        continue;
+      }
+    }
+
+    append(value.charAt(index), index, index + 1);
+    index += 1;
+  }
+
+  if (current !== undefined) {
+    tokens.push(current);
+  }
+
+  return tokens;
 }

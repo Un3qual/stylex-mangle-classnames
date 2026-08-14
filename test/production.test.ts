@@ -1030,7 +1030,7 @@ describe("production output", () => {
     expect(cssFile).not.toContain("_S");
   });
 
-  test("preserves authored strings containing a preliminary output filename", async () => {
+  test("updates exact marked filename tokens without rewriting surrounding text", async () => {
     const output = await buildWithAuthoredPreliminaryFileNameText();
 
     expect(output.preliminaryCssFileName).toContain("__STYLEX_HASH_");
@@ -1039,10 +1039,10 @@ describe("production output", () => {
       `application-copy: ${output.preliminaryCssFileName}`,
     );
     expect(output.javascript).not.toContain(`application-copy: ${output.cssFileName}`);
-    expect(output.javascript).toContain(
+    expect(output.javascript).not.toContain(
       `globalThis.exactCopy = ${JSON.stringify(output.preliminaryCssFileName)};`,
     );
-    expect(output.javascript).not.toContain(
+    expect(output.javascript).toContain(
       `globalThis.exactCopy = ${JSON.stringify(output.cssFileName)};`,
     );
   });
