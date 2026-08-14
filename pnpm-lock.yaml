@@ -14,6 +14,9 @@ importers:
       entities:
         specifier: 7.0.1
         version: 7.0.1
+      estree-walker:
+        specifier: 3.0.3
+        version: 3.0.3
       magic-string:
         specifier: ^1.1.1
         version: 1.1.1
@@ -26,6 +29,9 @@ importers:
       postcss-selector-parser:
         specifier: 7.1.4
         version: 7.1.4
+      postcss-value-parser:
+        specifier: 4.2.0
+        version: 4.2.0
     devDependencies:
       '@changesets/cli':
         specifier: ^3.0.0
@@ -599,6 +605,9 @@ packages:
   postcss-selector-parser@7.1.4:
     resolution: {integrity: sha512-HeP7D2wyhkR+XaK6v4W8oRF62Dsz4flyuczALJp61GckGm42u1saSSJ/0auvcBqxs3jMRFEcPK34At/0JBKdOg==}
     engines: {node: '>=4'}
+
+  postcss-value-parser@4.2.0:
+    resolution: {integrity: sha512-1NNCs6uurfkVbeXG4S8JFT9t19m45ICnif8zWLd5oPSZ50QnwMfK+H3jv408d4jw/7Bttv5axS5IiHoLaVNHeQ==}
 
   postcss@8.5.26:
     resolution: {integrity: sha512-u82N74LFzG8ca+dD8puPnplTXoGH4fTPpVGuIbt36G3qvNlkvfD0lEAZSxaly3KX8TS/L1A1gsCEmvKmBcVbkQ==}
@@ -1201,6 +1210,8 @@ snapshots:
     dependencies:
       cssesc: 3.0.0
       util-deprecate: 1.0.2
+
+  postcss-value-parser@4.2.0: {}
 
   postcss@8.5.26:
     dependencies:

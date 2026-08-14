@@ -17,6 +17,7 @@ export type HtmlStartTag = {
 };
 
 export type HtmlAttribute = {
+  decodedValue?: string;
   name: string;
   value?: string;
   valueEnd?: number;
@@ -42,6 +43,7 @@ function htmlAttribute(
   source: string,
   tagStart: number,
   name: string,
+  decodedValue: string,
   location: { endOffset: number; startOffset: number },
 ): HtmlAttribute {
   const attributeSource = source.slice(location.startOffset, location.endOffset);
@@ -65,6 +67,7 @@ function htmlAttribute(
   const absoluteValueEnd = location.startOffset + Math.max(valueStart, valueEnd);
 
   return {
+    decodedValue,
     name,
     value: source.slice(absoluteValueStart, absoluteValueEnd),
     valueEnd: absoluteValueEnd - tagStart,
@@ -92,6 +95,7 @@ export function findHtmlStartTags(source: string): HtmlStartTag[] {
                   source,
                   startTag.startOffset,
                   attribute.name,
+                  attribute.value,
                   attributeLocation,
                 ),
               ];

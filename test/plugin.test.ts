@@ -61,6 +61,34 @@ function outputOptionsResult(
   return result;
 }
 
+function preliminaryAssetFileName(
+  plugin: Plugin,
+  name: string,
+  source: string | Uint8Array,
+  hash: string,
+): string {
+  const resolved = outputOptionsResult(plugin, {
+    assetFileNames: "assets/[name]-[hash][extname]",
+  });
+
+  if (typeof resolved.assetFileNames !== "function") {
+    throw new Error("Expected an asset filename callback");
+  }
+
+  const pattern = resolved.assetFileNames({
+    name,
+    source,
+    type: "asset",
+  } as Rollup.PreRenderedAsset);
+  const extensionIndex = name.lastIndexOf(".");
+  const baseName = extensionIndex < 0 ? name : name.slice(0, extensionIndex);
+  const extension = extensionIndex < 0 ? "" : name.slice(extensionIndex);
+
+  return materializeHashPlaceholders(pattern, hash)
+    .replace("[name]", baseName)
+    .replace("[extname]", extension);
+}
+
 function runGenerateBundle(plugin: Plugin, bundle: Rollup.OutputBundle): void {
   const moduleIds = Object.values(bundle)
     .filter((output): output is Rollup.OutputChunk => output.type === "chunk")
@@ -745,6 +773,102 @@ describe("stylexMangleClassNames", () => {
     });
 
     expect(html.source).toBe(htmlSource);
+  });
+
+  test("preserves preliminary filenames in non-URL CSS strings", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const targetSource = ".theme{color:red}";
+    const preliminaryCssFileName = preliminaryAssetFileName(
+      plugin,
+      "theme.css",
+      targetSource,
+      "theme000",
+    );
+    const target = outputAsset(preliminaryCssFileName, targetSource);
+    const authoredSource = `.label::before{content:"${preliminaryCssFileName}"}`;
+    const authored = outputAsset("authored.css", authoredSource);
+
+    runGenerateBundle(plugin, {
+      [authored.fileName]: authored,
+      [target.fileName]: target,
+    });
+
+    expect(target.fileName).not.toBe(preliminaryCssFileName);
+    expect(authored.source).toBe(authoredSource);
+  });
+
+  test("updates asset URLs in inline HTML CSS", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const targetSource = ".theme{color:red}";
+    const preliminaryCssFileName = preliminaryAssetFileName(
+      plugin,
+      "theme.css",
+      targetSource,
+      "theme000",
+    );
+    const target = outputAsset(preliminaryCssFileName, targetSource);
+    const html = outputAsset(
+      "index.html",
+      `<style>@import "${preliminaryCssFileName}";</style><div style="background:url('${preliminaryCssFileName}')"></div>`,
+    );
+
+    runGenerateBundle(plugin, {
+      [html.fileName]: html,
+      [target.fileName]: target,
+    });
+
+    expect(html.source).toBe(
+      `<style>@import "${target.fileName}";</style><div style="background:url('${target.fileName}')"></div>`,
+    );
+  });
+
+  test("matches HTML asset URLs after decoding character references", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const targetSource = ".theme{color:red}";
+    const preliminaryCssFileName = preliminaryAssetFileName(
+      plugin,
+      "theme.css",
+      targetSource,
+      "theme000",
+    );
+    const encodedFileName = preliminaryCssFileName.replace("-", "&#45;");
+    const target = outputAsset(preliminaryCssFileName, targetSource);
+    const html = outputAsset("index.html", `<link href="${encodedFileName}">`);
+
+    runGenerateBundle(plugin, {
+      [html.fileName]: html,
+      [target.fileName]: target,
+    });
+
+    expect(html.source).toBe(`<link href="${target.fileName}">`);
+  });
+
+  test("updates JavaScript output references separated by comments", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const targetSource = ".theme{color:red}";
+    const preliminaryCssFileName = preliminaryAssetFileName(
+      plugin,
+      "theme.css",
+      targetSource,
+      "theme000",
+    );
+    const target = outputAsset(preliminaryCssFileName, targetSource);
+    const relativeFileName = `./${preliminaryCssFileName}`;
+    const javascript = outputChunk(
+      [
+        `import /* generated asset */ "${relativeFileName}";`,
+        `import(/* generated asset */ "${relativeFileName}");`,
+        `new URL(/* generated asset */ "${relativeFileName}", import.meta.url);`,
+      ].join("\n"),
+    );
+
+    runGenerateBundle(plugin, {
+      [javascript.fileName]: javascript,
+      [target.fileName]: target,
+    });
+
+    expect(javascript.code).not.toContain(preliminaryCssFileName);
+    expect(javascript.code.match(new RegExp(target.fileName, "g"))).toHaveLength(3);
   });
 
   test("updates double-quoted references to filenames containing apostrophes", () => {
@@ -1891,6 +2015,61 @@ describe("stylexMangleClassNames", () => {
     });
 
     expect(css.source).toBe('.a{color:red}[class~="a" i]{color:blue}');
+  });
+
+  test("preserves substring class attribute selectors", () => {
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    );
+    const css = outputAsset(
+      "styles.css",
+      `.${PREFIX}1{color:red}[class^="${PREFIX}1"]{color:blue}`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [css.fileName]: css,
+      [javascript.fileName]: javascript,
+    });
+
+    expect(css.source).toBe(`.a{color:red}[class^="${PREFIX}1"]{color:blue}`);
+  });
+
+  test("splits CSS class values only on CSS whitespace", () => {
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    );
+    const css = outputAsset(
+      "styles.css",
+      `.${PREFIX}1{color:red}[class~="${PREFIX}1\u00a0label"]{color:blue}`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [css.fileName]: css,
+      [javascript.fileName]: javascript,
+    });
+
+    expect(css.source).toBe(
+      `.a{color:red}[class~="${PREFIX}1\u00a0label"]{color:blue}`,
+    );
+  });
+
+  test("preserves namespaced class attribute selectors", () => {
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${PREFIX}1", $$css: true };`,
+    );
+    const css = outputAsset(
+      "styles.css",
+      `@namespace svg url(icon.svg);.${PREFIX}1{color:red}[svg|class~="${PREFIX}1"]{color:blue}`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix: PREFIX }), {
+      [css.fileName]: css,
+      [javascript.fileName]: javascript,
+    });
+
+    expect(css.source).toBe(
+      `@namespace svg url(icon.svg);.a{color:red}[svg|class~="${PREFIX}1"]{color:blue}`,
+    );
   });
 
   test("rewrites classes in text assets with uppercase extensions", () => {

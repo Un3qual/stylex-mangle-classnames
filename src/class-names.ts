@@ -88,7 +88,8 @@ function selectorClassReferences(selector: string): SelectorClassReference[] {
   ast.walkAttributes((node) => {
     if (
       node.attribute.toLowerCase() !== "class" ||
-      node.operator === undefined ||
+      node.namespace !== undefined ||
+      (node.operator !== "=" && node.operator !== "~=") ||
       node.value === undefined
     ) {
       return;
@@ -98,7 +99,8 @@ function selectorClassReferences(selector: string): SelectorClassReference[] {
     const normalize = insensitive
       ? (className: string) => className.toLowerCase()
       : (className: string) => className;
-    const classNames = [...node.value.matchAll(/\S+/g)].map((match) =>
+    const classNamePattern = /[^\t\n\f\r ]+/g;
+    const classNames = [...node.value.matchAll(classNamePattern)].map((match) =>
       normalize(match[0]),
     );
 
@@ -107,7 +109,7 @@ function selectorClassReferences(selector: string): SelectorClassReference[] {
       end: node.sourceIndex + node.toString().length,
       replacement: (replacements) => {
         const value = node.value?.replace(
-          /\S+/g,
+          /[^\t\n\f\r ]+/g,
           (className) =>
             classNameReplacement(replacements, className, insensitive) ??
             className,

@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
+import { escapeAttribute } from "entities";
+import { walk, type Node as EstreeNode } from "estree-walker";
+import postcss from "postcss";
+import valueParser from "postcss-value-parser";
 import type { Plugin, ResolvedConfig, Rollup } from "vite";
 import {
   findCssClassNamesInSelectors,
@@ -263,7 +267,7 @@ function replaceFileNameReference(
   return value;
 }
 
-type StructuredReferenceKind = "generic" | "html" | "javascript";
+type StructuredReferenceKind = "css" | "generic" | "html" | "javascript";
 
 type TextToken = {
   end: number;
@@ -289,27 +293,112 @@ function quotedTokens(value: string): TextToken[] {
   return tokens;
 }
 
-function javascriptFileNameReferenceTokens(value: string): TextToken[] {
-  return quotedTokens(value).filter((token) => {
-    const before = value.slice(Math.max(0, token.start - 160), token.start - 1);
-    const after = value.slice(token.end + 1, token.end + 100);
+type ParseJavaScript = (code: string) => unknown;
 
-    return (
-      (/\bnew\s+URL\s*\(\s*$/.test(before) &&
-        /^\s*,\s*import\.meta\.url\s*\)/.test(after)) ||
-      (/\bimport\s*\(\s*$/.test(before) && /^\s*\)/.test(after)) ||
-      /\b(?:from|import)\s*$/.test(before)
-    );
-  });
+type AstNode = Record<string, unknown>;
+
+function astNode(value: unknown): AstNode | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as AstNode)
+    : null;
+}
+
+function javascriptStringToken(source: string, value: unknown): TextToken | null {
+  const node = astNode(value);
+
+  if (
+    node?.type !== "Literal" ||
+    typeof node.value !== "string" ||
+    typeof node.start !== "number" ||
+    typeof node.end !== "number"
+  ) {
+    return null;
+  }
+
+  const quote = source.charAt(node.start);
+
+  if ((quote !== '"' && quote !== "'") || source.charAt(node.end - 1) !== quote) {
+    return null;
+  }
+
+  return {
+    end: node.end - 1,
+    start: node.start + 1,
+    value: source.slice(node.start + 1, node.end - 1),
+  };
+}
+
+function isImportMetaUrl(value: unknown): boolean {
+  const member = astNode(value);
+  const object = astNode(member?.object);
+  const property = astNode(member?.property);
+
+  return (
+    member?.type === "MemberExpression" &&
+    object?.type === "MetaProperty" &&
+    astNode(object.meta)?.name === "import" &&
+    astNode(object.property)?.name === "meta" &&
+    property?.type === "Identifier" &&
+    property.name === "url"
+  );
+}
+
+function javascriptFileNameReferenceTokens(
+  value: string,
+  parseJavaScript: ParseJavaScript,
+): TextToken[] {
+  const tokens = new Map<string, TextToken>();
+
+  function addToken(valueNode: unknown): void {
+    const token = javascriptStringToken(value, valueNode);
+
+    if (token !== null) {
+      tokens.set(`${token.start}:${token.end}`, token);
+    }
+  }
+
+  try {
+    walk(parseJavaScript(value) as EstreeNode, {
+      enter(estreeNode) {
+        const node = estreeNode as unknown as AstNode;
+
+        if (
+          node.type === "ImportDeclaration" ||
+          node.type === "ExportAllDeclaration" ||
+          node.type === "ExportNamedDeclaration"
+        ) {
+          addToken(node.source);
+        } else if (node.type === "ImportExpression") {
+          addToken(node.source);
+        } else if (node.type === "NewExpression") {
+          const callee = astNode(node.callee);
+          const argumentsList = Array.isArray(node.arguments) ? node.arguments : [];
+
+          if (
+            callee?.type === "Identifier" &&
+            callee.name === "URL" &&
+            isImportMetaUrl(argumentsList[1])
+          ) {
+            addToken(argumentsList[0]);
+          }
+        }
+      },
+    });
+  } catch {
+    return [];
+  }
+
+  return [...tokens.values()].sort((left, right) => left.start - right.start);
 }
 
 function javascriptFileNameReferenceEdits(
   value: string,
   replacements: ReadonlyMap<string, string>,
+  parseJavaScript: ParseJavaScript,
 ): StylexClassNameEdit[] {
   const edits: StylexClassNameEdit[] = [];
 
-  for (const token of javascriptFileNameReferenceTokens(value)) {
+  for (const token of javascriptFileNameReferenceTokens(value, parseJavaScript)) {
     const replacement = replaceFileNameReference(token.value, replacements);
 
     if (replacement !== token.value) {
@@ -342,36 +431,82 @@ function javascriptFileNameReferenceEdits(
   return edits;
 }
 
-function cssFileNameReferenceEdits(
-  value: string,
-  replacements: ReadonlyMap<string, string>,
-): StylexClassNameEdit[] {
-  const edits: StylexClassNameEdit[] = [];
+function cssValueUrlTokens(value: string, offset = 0): TextToken[] {
+  const tokens: TextToken[] = [];
+  const parsed = valueParser(value);
 
-  function addEdit(start: number, end: number, token: string): void {
-    if (edits.some((edit) => start < edit.end && end > edit.start)) {
+  parsed.walk((node) => {
+    if (node.type !== "function" || node.value.toLowerCase() !== "url") {
       return;
     }
 
-    const replacement = replaceFileNameReference(token, replacements);
+    const token = node.nodes.find(
+      (candidate) => candidate.type !== "space" && candidate.type !== "comment",
+    );
 
-    if (replacement !== token) {
-      edits.push({ end, replacement, start });
+    if (token?.type !== "string" && token?.type !== "word") {
+      return false;
     }
-  }
 
-  for (const token of quotedTokens(value)) {
-    addEdit(token.start, token.end, token.value);
-  }
+    const quoted = token.type === "string";
+    const start = offset + token.sourceIndex + (quoted ? 1 : 0);
+    const end = offset + token.sourceEndIndex - (quoted ? 1 : 0);
+    tokens.push({ end, start, value: value.slice(start - offset, end - offset) });
+    return false;
+  });
 
-  for (const match of value.matchAll(/\burl\(\s*([^"')\s][^)]*?)\s*\)/gi)) {
-    const token = match[1];
+  return tokens;
+}
 
-    if (token !== undefined) {
-      const start = match.index + match[0].indexOf(token);
-      addEdit(start, start + token.length, token);
+function cssFileNameReferenceTokens(value: string): TextToken[] {
+  const tokens: TextToken[] = [];
+  const root = postcss.parse(value);
+
+  root.walkDecls((declaration) => {
+    const start = declaration.source?.start?.offset;
+
+    if (start === undefined) {
+      return;
     }
-  }
+
+    const valueStart =
+      start + declaration.prop.length + (declaration.raws.between ?? "").length;
+    tokens.push(...cssValueUrlTokens(declaration.value, valueStart));
+  });
+
+  root.walkAtRules((atRule) => {
+    const start = atRule.source?.start?.offset;
+
+    if (start === undefined) {
+      return;
+    }
+
+    const paramsStart =
+      start + 1 + atRule.name.length + (atRule.raws.afterName ?? "").length;
+    const parsed = valueParser(atRule.params);
+    tokens.push(...cssValueUrlTokens(atRule.params, paramsStart));
+
+    if (!new Set(["import", "namespace"]).has(atRule.name.toLowerCase())) {
+      return;
+    }
+
+    const token = parsed.nodes.find(
+      (candidate) => candidate.type !== "space" && candidate.type !== "comment",
+    );
+
+    if (token?.type !== "string" && token?.type !== "word") {
+      return;
+    }
+
+    const quoted = token.type === "string";
+    const tokenStart = paramsStart + token.sourceIndex + (quoted ? 1 : 0);
+    const tokenEnd = paramsStart + token.sourceEndIndex - (quoted ? 1 : 0);
+    tokens.push({
+      end: tokenEnd,
+      start: tokenStart,
+      value: value.slice(tokenStart, tokenEnd),
+    });
+  });
 
   for (const match of value.matchAll(/((?:sourceMappingURL|sourceURL)=)([^\s*]+)/g)) {
     const prefix = match[1] ?? "";
@@ -379,11 +514,21 @@ function cssFileNameReferenceEdits(
 
     if (token !== undefined) {
       const start = match.index + prefix.length;
-      addEdit(start, start + token.length, token);
+      tokens.push({ end: start + token.length, start, value: token });
     }
   }
 
-  return edits;
+  return [...new Map(tokens.map((token) => [`${token.start}:${token.end}`, token])).values()];
+}
+
+function cssFileNameReferenceEdits(
+  value: string,
+  replacements: ReadonlyMap<string, string>,
+): StylexClassNameEdit[] {
+  return cssFileNameReferenceTokens(value).flatMap((token) => {
+    const replacement = replaceFileNameReference(token.value, replacements);
+    return replacement === token.value ? [] : [{ ...token, replacement }];
+  });
 }
 
 function applyTextEdits(
@@ -451,15 +596,73 @@ function srcsetUrlTokens(value: string): TextToken[] {
   return tokens;
 }
 
+function replacementEditsForTokens(
+  tokens: readonly TextToken[],
+  replacements: ReadonlyMap<string, string>,
+): StylexClassNameEdit[] {
+  return tokens.flatMap((token) => {
+    const replacement = replaceFileNameReference(token.value, replacements);
+    return replacement === token.value ? [] : [{ ...token, replacement }];
+  });
+}
+
+function htmlStyleElement(tag: ReturnType<typeof findHtmlStartTags>[number]): boolean {
+  if (tag.tagName !== "style") {
+    return false;
+  }
+
+  const type = findHtmlAttributes(tag).find((attribute) => attribute.name === "type")
+    ?.decodedValue;
+  const normalizedType = type?.trim().toLowerCase() ?? "";
+  return normalizedType === "" || normalizedType === "text/css";
+}
+
+function htmlFileNameReferenceTokens(value: string): string[] {
+  const tokens: string[] = [];
+
+  for (const tag of findHtmlStartTags(value)) {
+    for (const attribute of findHtmlAttributes(tag)) {
+      const attributeValue = attribute.decodedValue ?? attribute.value;
+
+      if (attributeValue === undefined) {
+        continue;
+      }
+
+      if (htmlUrlAttributeNames.has(attribute.name)) {
+        tokens.push(attributeValue);
+      } else if (htmlSrcsetAttributeNames.has(attribute.name)) {
+        tokens.push(...srcsetUrlTokens(attributeValue).map((token) => token.value));
+      } else if (attribute.name === "style") {
+        tokens.push(...cssValueUrlTokens(attributeValue).map((token) => token.value));
+      }
+    }
+
+    if (
+      htmlStyleElement(tag) &&
+      tag.contentStart !== undefined &&
+      tag.contentEnd !== undefined
+    ) {
+      tokens.push(
+        ...cssFileNameReferenceTokens(
+          value.slice(tag.contentStart, tag.contentEnd),
+        ).map((token) => token.value),
+      );
+    }
+  }
+
+  return tokens;
+}
+
 function fileNameReferenceTokens(
   value: string,
   kind: StructuredReferenceKind,
+  parseJavaScript: ParseJavaScript,
 ): string[] {
   const tokens: string[] = [];
 
   const structuredTokens =
     kind === "javascript"
-      ? javascriptFileNameReferenceTokens(value)
+      ? javascriptFileNameReferenceTokens(value, parseJavaScript)
       : kind === "generic"
         ? quotedTokens(value)
         : [];
@@ -478,6 +681,10 @@ function fileNameReferenceTokens(
     }
   }
 
+  if (kind === "css") {
+    tokens.push(...cssFileNameReferenceTokens(value).map((token) => token.value));
+  }
+
   if (kind !== "html") {
     for (const match of value.matchAll(/(?:sourceMappingURL|sourceURL)=([^\s*]+)/g)) {
       const token = match[1];
@@ -489,21 +696,7 @@ function fileNameReferenceTokens(
   }
 
   if (kind === "html") {
-    for (const tag of findHtmlStartTags(value)) {
-      for (const attribute of findHtmlAttributes(tag)) {
-        if (attribute.value === undefined) {
-          continue;
-        }
-
-        if (htmlUrlAttributeNames.has(attribute.name)) {
-          tokens.push(attribute.value);
-        } else if (htmlSrcsetAttributeNames.has(attribute.name)) {
-          tokens.push(
-            ...srcsetUrlTokens(attribute.value).map((token) => token.value),
-          );
-        }
-      }
-    }
+    tokens.push(...htmlFileNameReferenceTokens(value));
   }
 
   return tokens;
@@ -513,21 +706,24 @@ function replaceStructuredFileNameReferences(
   value: string,
   replacements: ReadonlyMap<string, string>,
   kind: StructuredReferenceKind,
+  parseJavaScript: ParseJavaScript,
 ): string {
   if (kind === "javascript") {
     return applyTextEdits(
       value,
-      javascriptFileNameReferenceEdits(value, replacements),
+      javascriptFileNameReferenceEdits(value, replacements, parseJavaScript),
     );
   }
 
+  if (kind === "css") {
+    return applyTextEdits(value, cssFileNameReferenceEdits(value, replacements));
+  }
+
   if (kind === "html") {
-    let updatedHtml = value;
+    const edits: StylexClassNameEdit[] = [];
 
-    for (const tag of findHtmlStartTags(value).reverse()) {
-      let updatedTag = tag.source;
-
-      for (const attribute of findHtmlAttributes(tag).reverse()) {
+    for (const tag of findHtmlStartTags(value)) {
+      for (const attribute of findHtmlAttributes(tag)) {
         if (
           attribute.value === undefined ||
           attribute.valueStart === undefined ||
@@ -536,32 +732,53 @@ function replaceStructuredFileNameReferences(
           continue;
         }
 
-        let updatedValue = attribute.value;
+        const decodedValue = attribute.decodedValue ?? attribute.value;
+        let updatedValue = decodedValue;
 
         if (htmlUrlAttributeNames.has(attribute.name)) {
-          updatedValue = replaceFileNameReference(attribute.value, replacements);
+          updatedValue = replaceFileNameReference(decodedValue, replacements);
         } else if (htmlSrcsetAttributeNames.has(attribute.name)) {
-          for (const token of srcsetUrlTokens(attribute.value).reverse()) {
-            const replacement = replaceFileNameReference(
-              token.value,
-              replacements,
-            );
-
-            if (replacement !== token.value) {
-              updatedValue = `${updatedValue.slice(0, token.start)}${replacement}${updatedValue.slice(token.end)}`;
-            }
-          }
+          updatedValue = applyTextEdits(
+            decodedValue,
+            replacementEditsForTokens(srcsetUrlTokens(decodedValue), replacements),
+          );
+        } else if (attribute.name === "style") {
+          updatedValue = applyTextEdits(
+            decodedValue,
+            replacementEditsForTokens(cssValueUrlTokens(decodedValue), replacements),
+          );
         }
 
-        if (updatedValue !== attribute.value) {
-          updatedTag = `${updatedTag.slice(0, attribute.valueStart)}${updatedValue}${updatedTag.slice(attribute.valueEnd)}`;
+        if (updatedValue !== decodedValue) {
+          edits.push({
+            end: tag.start + attribute.valueEnd,
+            replacement:
+              decodedValue === attribute.value
+                ? updatedValue
+                : escapeAttribute(updatedValue),
+            start: tag.start + attribute.valueStart,
+          });
         }
       }
 
-      updatedHtml = `${updatedHtml.slice(0, tag.start)}${updatedTag}${updatedHtml.slice(tag.end)}`;
+      if (
+        htmlStyleElement(tag) &&
+        tag.contentStart !== undefined &&
+        tag.contentEnd !== undefined
+      ) {
+        const contentStart = tag.contentStart;
+        const source = value.slice(contentStart, tag.contentEnd);
+        edits.push(
+          ...cssFileNameReferenceEdits(source, replacements).map((edit) => ({
+            ...edit,
+            end: contentStart + edit.end,
+            start: contentStart + edit.start,
+          })),
+        );
+      }
     }
 
-    return updatedHtml;
+    return applyTextEdits(value, edits);
   }
 
   let replaceQuoted = value;
@@ -869,6 +1086,10 @@ function structuredReferenceKind(output: OutputFile): StructuredReferenceKind {
     return "javascript";
   }
 
+  if (output.type === "asset" && output.fileName.toLowerCase().endsWith(".css")) {
+    return "css";
+  }
+
   return output.type === "asset" && output.fileName.toLowerCase().endsWith(".html")
     ? "html"
     : "generic";
@@ -963,6 +1184,7 @@ function normalizeFileNameReferences(
   value: string,
   externalReplacements: ReadonlyMap<string, string>,
   internalReplacements: ReadonlyMap<string, string>,
+  parseJavaScript: ParseJavaScript,
 ): string {
   const replacements = new Map([
     ...externalReplacements,
@@ -975,6 +1197,7 @@ function normalizeFileNameReferences(
           value,
           replacements,
           structuredReferenceKind(output),
+          parseJavaScript,
         );
 
   return replaceInlineSourceMapFileNameReferences(updatedValue, replacements);
@@ -984,6 +1207,7 @@ function outputDependencies(
   outputs: readonly OutputFile[],
   preliminaryFileNames: ReadonlyMap<OutputFile, string>,
   markers: ReadonlyMap<string, HashMarker>,
+  parseJavaScript: ParseJavaScript,
 ): Map<OutputFile, Set<OutputFile>> {
   const outputsBySentinel = new Map<string, Set<OutputFile>>();
 
@@ -1019,6 +1243,7 @@ function outputDependencies(
       for (const token of fileNameReferenceTokens(
         textValue(output) ?? "",
         structuredReferenceKind(output),
+        parseJavaScript,
       )) {
         for (const sentinel of token.match(hashMarkerSentinelPattern) ?? []) {
           const markerOutputs = outputsBySentinel.get(sentinel);
@@ -1146,6 +1371,7 @@ function computeFinalFileNames(
   groups: readonly (readonly OutputFile[])[],
   markers: ReadonlyMap<string, HashMarker>,
   hashCharacters: HashCharacters,
+  parseJavaScript: ParseJavaScript,
 ): Map<OutputFile, string> {
   const groupByOutput = new Map<OutputFile, number>();
 
@@ -1243,6 +1469,7 @@ function computeFinalFileNames(
                 textValue(output) ?? "",
                 externalReplacements,
                 internalReplacements,
+                parseJavaScript,
               );
         const metadata = metadataValues(output).map((value) =>
           normalizeFileNameReferences(
@@ -1250,6 +1477,7 @@ function computeFinalFileNames(
             value,
             externalReplacements,
             internalReplacements,
+            parseJavaScript,
           ),
         );
 
@@ -1328,12 +1556,14 @@ function updateOutputFileNameReferences(
   bundle: Rollup.OutputBundle,
   outputs: readonly OutputFile[],
   replacements: ReadonlyMap<string, string>,
+  parseJavaScript: ParseJavaScript,
 ): void {
   for (const output of outputs) {
     if (output.type === "chunk") {
       const edits = javascriptFileNameReferenceEdits(
         output.code,
         replacements,
+        parseJavaScript,
       );
       const updatedCode =
         edits.length === 0
@@ -1423,6 +1653,7 @@ function updateOutputFileNameReferences(
         const edits = javascriptFileNameReferenceEdits(
           source,
           replacements,
+          parseJavaScript,
         );
         updatedSource =
           edits.length === 0
@@ -1438,6 +1669,7 @@ function updateOutputFileNameReferences(
           source,
           replacements,
           structuredReferenceKind(output),
+          parseJavaScript,
         );
       }
 
@@ -1484,6 +1716,7 @@ function finalizeOutputHashMarkers(
   hashCharacters: HashCharacters,
   assetMarkers: ReadonlyMap<string, HashMarker>,
   chunkMarkers: ReadonlyMap<string, HashMarker>,
+  parseJavaScript: ParseJavaScript,
 ): void {
   const markers = new Map([...assetMarkers, ...chunkMarkers]);
 
@@ -1500,6 +1733,7 @@ function finalizeOutputHashMarkers(
     outputValues,
     preliminaryFileNames,
     markers,
+    parseJavaScript,
   );
   const groups = stronglyConnectedOutputGroups(outputValues, dependencies);
   const finalFileNames = computeFinalFileNames(
@@ -1509,6 +1743,7 @@ function finalizeOutputHashMarkers(
     groups,
     markers,
     hashCharacters,
+    parseJavaScript,
   );
 
   assertUniqueFinalFileNames(outputValues, finalFileNames);
@@ -1532,6 +1767,7 @@ function finalizeOutputHashMarkers(
     bundle,
     outputValues,
     finalizedFileNameReplacements,
+    parseJavaScript,
   );
 
   for (const [, output] of outputs) {
@@ -1908,6 +2144,7 @@ export default function stylexMangleClassNames(
           outputOptions.hashCharacters ?? "base64",
           assetHashMarkers,
           chunkHashMarkers,
+          (code) => this.parse(code),
         );
         cssAssetsFinalized = true;
       },

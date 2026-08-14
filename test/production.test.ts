@@ -495,6 +495,11 @@ async function buildWithAuthoredPreliminaryFileNameText(): Promise<{
           javascript.code += `\nglobalThis.prefixedCopy = ${JSON.stringify(
             `application-copy: ${preliminaryCssFileName}`,
           )};\nglobalThis.exactCopy = ${JSON.stringify(preliminaryCssFileName)};`;
+          javascript.code += [
+            `\nimport /* generated asset */ ${JSON.stringify(preliminaryCssFileName)};`,
+            `void import(/* generated asset */ ${JSON.stringify(preliminaryCssFileName)});`,
+            `void new URL(/* generated asset */ ${JSON.stringify(preliminaryCssFileName)}, import.meta.url);`,
+          ].join("\n");
         },
       },
       stylexMangleClassNames({ classNamePrefix: PREFIX }),
@@ -1045,6 +1050,12 @@ describe("production output", () => {
     expect(output.javascript).not.toContain(
       `globalThis.exactCopy = ${JSON.stringify(output.cssFileName)};`,
     );
+  });
+
+  test("finalizes commented JavaScript output references in a Vite build", async () => {
+    const output = await buildWithAuthoredPreliminaryFileNameText();
+
+    expect(output.javascript.split(JSON.stringify(output.cssFileName))).toHaveLength(4);
   });
 
   test("does not reserve class names from tree-shaken runtime rules", async () => {
