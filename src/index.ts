@@ -47,6 +47,7 @@ type RenderChunkMeta = {
 
 type CompatibleOutputChunk = Rollup.OutputChunk & {
   implicitlyLoadedBefore?: string[];
+  importedBindings?: Record<string, string[]>;
   referencedFiles?: string[];
 };
 
@@ -271,6 +272,7 @@ type StructuredReferenceKind = "css" | "generic" | "html" | "javascript";
 
 type TextToken = {
   end: number;
+  quote?: '"' | "'";
   start: number;
   value: string;
 };
@@ -469,11 +471,100 @@ function cssValueUrlTokens(value: string, offset = 0): TextToken[] {
       const quoted = token.type === "string";
       const start = offset + token.sourceIndex + (quoted ? 1 : 0);
       const end = offset + token.sourceEndIndex - (quoted ? 1 : 0);
-      tokens.push({ end, start, value: value.slice(start - offset, end - offset) });
+      const quote = quoted && (token.quote === '"' || token.quote === "'")
+        ? token.quote
+        : undefined;
+      tokens.push({
+        end,
+        quote,
+        start,
+        value: value.slice(start - offset, end - offset),
+      });
     }
   });
 
   return tokens;
+}
+
+function decodeCssEscapes(value: string): string {
+  let decoded = "";
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value.charAt(index);
+
+    if (character !== "\\" || index + 1 >= value.length) {
+      decoded += character;
+      continue;
+    }
+
+    const escaped = value.slice(index + 1);
+    const hexadecimal = /^[0-9a-f]{1,6}/i.exec(escaped)?.[0];
+
+    if (hexadecimal !== undefined) {
+      const codePoint = Number.parseInt(hexadecimal, 16);
+      decoded +=
+        codePoint === 0 ||
+        codePoint > 0x10ffff ||
+        (codePoint >= 0xd800 && codePoint <= 0xdfff)
+          ? "\ufffd"
+          : String.fromCodePoint(codePoint);
+      index += hexadecimal.length;
+
+      const terminator = value.charAt(index + 1);
+
+      if (terminator === "\r" && value.charAt(index + 2) === "\n") {
+        index += 2;
+      } else if (/[\t\n\f\r ]/.test(terminator)) {
+        index += 1;
+      }
+      continue;
+    }
+
+    const next = value.charAt(index + 1);
+
+    if (next === "\r" || next === "\n" || next === "\f") {
+      index += next === "\r" && value.charAt(index + 2) === "\n" ? 2 : 1;
+    } else {
+      decoded += next;
+      index += 1;
+    }
+  }
+
+  return decoded;
+}
+
+function escapeCssString(value: string, quote: '"' | "'"): string {
+  return [...value]
+    .map((character) => {
+      if (character === "\\" || character === quote) {
+        return `\\${character}`;
+      }
+
+      return /[\n\r\f]/.test(character)
+        ? `\\${character.codePointAt(0)?.toString(16)} `
+        : character;
+    })
+    .join("");
+}
+
+function replaceCssFileNameReference(
+  token: TextToken,
+  replacements: ReadonlyMap<string, string>,
+): string {
+  const decoded = decodeCssEscapes(token.value);
+  const replacement = replaceFileNameReference(decoded, replacements);
+
+  if (replacement === decoded) {
+    return token.value;
+  }
+
+  if (decoded === token.value) {
+    return replacement;
+  }
+
+  const quote = token.quote ?? '"';
+  const escaped = escapeCssString(replacement, quote);
+  return token.quote === undefined ? `${quote}${escaped}${quote}` : escaped;
 }
 
 function cssFileNameReferenceTokens(value: string): TextToken[] {
@@ -519,8 +610,12 @@ function cssFileNameReferenceTokens(value: string): TextToken[] {
     const quoted = token.type === "string";
     const tokenStart = paramsStart + token.sourceIndex + (quoted ? 1 : 0);
     const tokenEnd = paramsStart + token.sourceEndIndex - (quoted ? 1 : 0);
+    const quote = quoted && (token.quote === '"' || token.quote === "'")
+      ? token.quote
+      : undefined;
     tokens.push({
       end: tokenEnd,
+      quote,
       start: tokenStart,
       value: value.slice(tokenStart, tokenEnd),
     });
@@ -544,7 +639,7 @@ function cssFileNameReferenceEdits(
   replacements: ReadonlyMap<string, string>,
 ): StylexClassNameEdit[] {
   return cssFileNameReferenceTokens(value).flatMap((token) => {
-    const replacement = replaceFileNameReference(token.value, replacements);
+    const replacement = replaceCssFileNameReference(token, replacements);
     return replacement === token.value ? [] : [{ ...token, replacement }];
   });
 }
@@ -635,6 +730,39 @@ function htmlStyleElement(tag: ReturnType<typeof findHtmlStartTags>[number]): bo
   return normalizedType === "" || normalizedType === "text/css";
 }
 
+function htmlMetaRefresh(
+  tag: ReturnType<typeof findHtmlStartTags>[number],
+): boolean {
+  return (
+    tag.tagName === "meta" &&
+    findHtmlAttributes(tag).some(
+      (attribute) =>
+        attribute.name === "http-equiv" &&
+        attribute.decodedValue?.trim().toLowerCase() === "refresh",
+    )
+  );
+}
+
+function metaRefreshUrlTokens(value: string): TextToken[] {
+  const directive = /;\s*url\s*=\s*/i.exec(value);
+
+  if (directive === null) {
+    return [];
+  }
+
+  let start = directive.index + directive[0].length;
+  const quote = value.charAt(start);
+
+  if (quote === '"' || quote === "'") {
+    start += 1;
+    const end = value.indexOf(quote, start);
+    return end < 0 ? [] : [{ end, quote, start, value: value.slice(start, end) }];
+  }
+
+  const end = value.slice(start).search(/\s*$/) + start;
+  return end <= start ? [] : [{ end, start, value: value.slice(start, end) }];
+}
+
 function htmlFileNameReferenceTokens(value: string): string[] {
   const tokens: string[] = [];
 
@@ -650,8 +778,14 @@ function htmlFileNameReferenceTokens(value: string): string[] {
         tokens.push(attributeValue);
       } else if (htmlSrcsetAttributeNames.has(attribute.name)) {
         tokens.push(...srcsetUrlTokens(attributeValue).map((token) => token.value));
+      } else if (attribute.name === "content" && htmlMetaRefresh(tag)) {
+        tokens.push(...metaRefreshUrlTokens(attributeValue).map((token) => token.value));
       } else if (attribute.name === "style") {
-        tokens.push(...cssValueUrlTokens(attributeValue).map((token) => token.value));
+        tokens.push(
+          ...cssValueUrlTokens(attributeValue).map((token) =>
+            decodeCssEscapes(token.value),
+          ),
+        );
       }
     }
 
@@ -663,7 +797,7 @@ function htmlFileNameReferenceTokens(value: string): string[] {
       tokens.push(
         ...cssFileNameReferenceTokens(
           value.slice(tag.contentStart, tag.contentEnd),
-        ).map((token) => token.value),
+        ).map((token) => decodeCssEscapes(token.value)),
       );
     }
   }
@@ -700,7 +834,11 @@ function fileNameReferenceTokens(
   }
 
   if (kind === "css") {
-    tokens.push(...cssFileNameReferenceTokens(value).map((token) => token.value));
+    tokens.push(
+      ...cssFileNameReferenceTokens(value).map((token) =>
+        decodeCssEscapes(token.value),
+      ),
+    );
   }
 
   if (kind !== "html") {
@@ -759,6 +897,14 @@ function replaceStructuredFileNameReferences(
           updatedValue = applyTextEdits(
             decodedValue,
             replacementEditsForTokens(srcsetUrlTokens(decodedValue), replacements),
+          );
+        } else if (attribute.name === "content" && htmlMetaRefresh(tag)) {
+          updatedValue = applyTextEdits(
+            decodedValue,
+            replacementEditsForTokens(
+              metaRefreshUrlTokens(decodedValue),
+              replacements,
+            ),
           );
         } else if (attribute.name === "style") {
           updatedValue = applyTextEdits(
@@ -1625,6 +1771,15 @@ function updateOutputFileNameReferences(
         replaceFileNameReferences(value, replacements),
       );
       const compatible = output as CompatibleOutputChunk;
+
+      if (compatible.importedBindings !== undefined) {
+        compatible.importedBindings = Object.fromEntries(
+          Object.entries(compatible.importedBindings).map(([fileName, bindings]) => [
+            replaceFileNameReferences(fileName, replacements),
+            bindings,
+          ]),
+        );
+      }
 
       if (compatible.implicitlyLoadedBefore !== undefined) {
         compatible.implicitlyLoadedBefore = compatible.implicitlyLoadedBefore.map(

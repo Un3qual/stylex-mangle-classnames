@@ -49,6 +49,10 @@ type SelectorClassReference = {
   start: number;
 };
 
+function foldAsciiCase(value: string): string {
+  return value.replace(/[A-Z]/g, (character) => character.toLowerCase());
+}
+
 function classNameReplacement(
   replacements: ReadonlyMap<string, string>,
   className: string,
@@ -60,10 +64,10 @@ function classNameReplacement(
     return exact;
   }
 
-  const normalized = className.toLowerCase();
+  const normalized = foldAsciiCase(className);
 
   for (const [candidate, replacement] of replacements) {
-    if (candidate.toLowerCase() === normalized) {
+    if (foldAsciiCase(candidate) === normalized) {
       return replacement;
     }
   }
@@ -96,7 +100,7 @@ function selectorClassReferences(selector: string): SelectorClassReference[] {
 
     const insensitive = node.insensitive === true;
     const normalize = insensitive
-      ? (className: string) => className.toLowerCase()
+      ? foldAsciiCase
       : (className: string) => className;
 
     if (

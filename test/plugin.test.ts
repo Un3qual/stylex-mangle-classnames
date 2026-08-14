@@ -464,8 +464,10 @@ describe("stylexMangleClassNames", () => {
     entry.dynamicImports = [dependencyName];
     const compatibleEntry = entry as Rollup.OutputChunk & {
       implicitlyLoadedBefore: string[];
+      importedBindings: Record<string, string[]>;
       referencedFiles: string[];
     };
+    compatibleEntry.importedBindings = { [dependencyName]: ["value"] };
     compatibleEntry.implicitlyLoadedBefore = [dependencyName];
     compatibleEntry.referencedFiles = [cssName];
     const bundle: Rollup.OutputBundle = {
@@ -481,6 +483,9 @@ describe("stylexMangleClassNames", () => {
     );
     expect(entry.imports).toEqual([dependency.fileName]);
     expect(entry.dynamicImports).toEqual([dependency.fileName]);
+    expect(compatibleEntry.importedBindings).toEqual({
+      [dependency.fileName]: ["value"],
+    });
     expect(compatibleEntry.implicitlyLoadedBefore).toEqual([dependency.fileName]);
     expect(compatibleEntry.referencedFiles).toEqual([css.fileName]);
   });
@@ -602,6 +607,31 @@ describe("stylexMangleClassNames", () => {
 
     expect(css.fileName).not.toBe(preliminaryCssFileName);
     expect(html.source).toBe(`<link rel=stylesheet href=${css.fileName}>`);
+  });
+
+  test("updates finalized filenames in meta refresh directives", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const targetSource = "<main>Next page</main>";
+    const preliminaryHtmlFileName = preliminaryAssetFileName(
+      plugin,
+      "next.html",
+      targetSource,
+      "nexthash",
+    );
+    const target = outputAsset(preliminaryHtmlFileName, targetSource);
+    const html = outputAsset(
+      "index.html",
+      `<meta http-equiv="refresh" content="0; url=${preliminaryHtmlFileName}">`,
+    );
+
+    runGenerateBundle(plugin, {
+      [html.fileName]: html,
+      [target.fileName]: target,
+    });
+
+    expect(html.source).toBe(
+      `<meta http-equiv="refresh" content="0; url=${target.fileName}">`,
+    );
   });
 
   test("updates root-relative references to root-level finalized assets", () => {
@@ -899,6 +929,29 @@ describe("stylexMangleClassNames", () => {
       );
     },
   );
+
+  test("updates CSS URLs whose filenames contain escapes", () => {
+    const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
+    const preliminaryImageFileName = preliminaryAssetFileName(
+      plugin,
+      "theme.png",
+      "image",
+      "image000",
+    );
+    const image = outputAsset(preliminaryImageFileName, "image");
+    const escapedImageFileName = preliminaryImageFileName.replace("-", "\\2d ");
+    const css = outputAsset(
+      "styles.css",
+      `.hero{background:url("${escapedImageFileName}")}`,
+    );
+
+    runGenerateBundle(plugin, {
+      [css.fileName]: css,
+      [image.fileName]: image,
+    });
+
+    expect(css.source).toBe(`.hero{background:url("${image.fileName}")}`);
+  });
 
   test("quotes decoded unquoted HTML URLs that contain whitespace", () => {
     const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
@@ -2096,6 +2149,24 @@ describe("stylexMangleClassNames", () => {
     });
 
     expect(css.source).toBe('.a{color:red}[class~="a" i]{color:blue}');
+  });
+
+  test("uses ASCII-only folding for insensitive class selectors", () => {
+    const classNamePrefix = "K";
+    const javascript = outputChunk(
+      `globalThis.style = { color: "${classNamePrefix}1", $$css: true };`,
+    );
+    const css = outputAsset(
+      "styles.css",
+      `.${classNamePrefix}1{color:red}[class~="\u212a1" i]{color:blue}`,
+    );
+
+    runGenerateBundle(stylexMangleClassNames({ classNamePrefix }), {
+      [css.fileName]: css,
+      [javascript.fileName]: javascript,
+    });
+
+    expect(css.source).toBe('.a{color:red}[class~="\u212a1" i]{color:blue}');
   });
 
   test("preserves substring class attribute selectors", () => {
