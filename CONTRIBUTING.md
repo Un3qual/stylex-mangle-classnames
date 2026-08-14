@@ -1,10 +1,8 @@
 # Contributing
 
-Thanks for helping improve `@un3qual/stylex-mangle-classnames`.
-
 ## Development setup
 
-Local development uses Node.js 20.19 or newer and pnpm 11.18.0 through Corepack:
+Local development uses Node.js 20.19+ or 22.12+, with pnpm 11.18.0 through Corepack:
 
 ```sh
 corepack enable
@@ -12,7 +10,7 @@ pnpm install
 pnpm run check
 ```
 
-Fork the repository, create a focused branch, and keep each change limited to one clear concern. The plugin supports Node.js 18 for consumers because Vite 5 remains in its peer range; the newer local Node requirement comes from the current Vite development dependency.
+Create a focused branch and keep each change limited to one concern.
 
 ## Tests
 
@@ -31,13 +29,11 @@ Review the package dry-run output for unintended files.
 
 Run `pnpm changeset` for user-visible fixes and features. Select the package, choose the semantic-version impact, and describe the outcome for users. Documentation, tests, CI, and repository-only maintenance do not require a changeset.
 
-Changesets do not publish this package automatically.
+Publishing is a separate release step.
 
 ## Releases
 
-Publishing uses npm trusted publishing from `.github/workflows/publish.yml`. The repository does not store an npm publishing token.
-
-The publish job intentionally relies on `publishConfig.registry` instead of configuring `registry-url` in `actions/setup-node`. The latter writes a token-auth entry to npm's user configuration and prevents npm from initiating the trusted-publisher OIDC exchange when no `NODE_AUTH_TOKEN` exists.
+Publishing uses npm trusted publishing from `.github/workflows/publish.yml`. The repository does not store an npm publishing token. The workflow uses `publishConfig.registry` so npm can perform the trusted-publisher OIDC exchange.
 
 Commit a Changeset with every user-visible change. When a release is ready:
 
