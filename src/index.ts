@@ -100,10 +100,6 @@ export default function stylexMangleClassNames(
       }
 
       for (const className of cssClassNames(assetSourceToString(output.source))) {
-        if (classNames.has(className)) {
-          continue;
-        }
-
         const original = generatedNames.get(className);
 
         if (original !== undefined && renderedClassNames.has(className)) {

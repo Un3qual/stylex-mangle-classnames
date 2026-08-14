@@ -159,7 +159,7 @@ async function runConfigResolved(
   } as ResolvedConfig);
 }
 
-async function runTransform(
+function runTransform(
   plugin: Plugin,
   code: string,
   id = "/virtual-entry.js",
@@ -292,6 +292,26 @@ describe("stylexMangleClassNames", () => {
     ).toThrow('generated class ".a" would collide with authored CSS');
   });
 
+  test("fails when an original class name is also an active generated name", () => {
+    const prefix = "a";
+    const originals = "123456789abcdefghijklmnopqr"
+      .split("")
+      .map((hash) => `${prefix}${hash}`);
+    const javascript = outputChunk(
+      originals
+        .map((className) => `inject({ ltr: ".${className}{color:red}" });`)
+        .join("\n"),
+    );
+    const css = outputAsset("styles.css", ".aa{color:blue}");
+
+    expect(() =>
+      runProductionBundle(stylexMangleClassNames({ classNamePrefix: prefix }), {
+        [css.fileName]: css,
+        [javascript.fileName]: javascript,
+      }),
+    ).toThrow('generated class ".aa" would collide with authored CSS');
+  });
+
   test("ignores short names reserved only by tree-shaken modules", () => {
     const javascript = outputChunk("globalThis.loaded = true;");
     const css = outputAsset("styles.css", ".a{color:blue}");
@@ -342,7 +362,7 @@ describe("stylexMangleClassNames", () => {
       `globalThis.className = "${PREFIX}1";`,
     ].join("\n");
 
-    await expect(runTransform(plugin, source)).resolves.toEqual({
+    expect(await runTransform(plugin, source)).toEqual({
       code: [
         'inject({ ltr: ".a{color:red}" });',
         'globalThis.className = "a";',
@@ -359,9 +379,9 @@ describe("stylexMangleClassNames", () => {
       `globalThis.className = "${PREFIX}1";`,
     ].join("\n");
 
-    await expect(
-      runTransform(plugin, source, "/index.html?html-proxy&index=0.js"),
-    ).resolves.toEqual({
+    expect(
+      await runTransform(plugin, source, "/index.html?html-proxy&index=0.js"),
+    ).toEqual({
       code: [
         'inject({ ltr: ".a{color:red}" });',
         'globalThis.className = "a";',
@@ -374,9 +394,9 @@ describe("stylexMangleClassNames", () => {
     const plugin = stylexMangleClassNames({ classNamePrefix: PREFIX });
     await runConfigResolved(plugin, "build");
 
-    await expect(
-      runTransform(plugin, `globalThis.className = "${PREFIX}1";`),
-    ).resolves.toBeNull();
+    expect(
+      await runTransform(plugin, `globalThis.className = "${PREFIX}1";`),
+    ).toBeNull();
   });
 
   test("accepts production source maps", async () => {
